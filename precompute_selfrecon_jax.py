@@ -1,20 +1,42 @@
 """
-precompute_selfrecon_jax.py — SigLIP2 self-reconstruction precompute (JAX/Flax).
+precompute_selfrecon_jax.py — k-shot precompute (JAX/Flax).
 
-For each image in the dataset, extract CLS token and patch tokens via SigLIP2
-JAX checkpoint. Save as ArrayRecord where condition = target image.
+For each image, extract CLS + patch tokens via a vision encoder and build
+ArrayRecord files for few-shot / self-reconstruction DiT training.
+
+Encoder backends:
+  - siglip2  (default): SigLIP2-B/16 via big_vision JAX checkpoint.
+  - dinov2          : DINOv2-B/14 via HuggingFace transformers (PyTorch→numpy).
+
+k-shot logic (--k K):
+  k=0  — self-reconstruction: target conditions on its own CLS token.
+  k>0  — few-shot: class images are tiled into non-overlapping groups of k+1.
+         Each group produces k+1 records by rotating which image is the target;
+         the remaining k images are supports whose CLS tokens are mean-pooled
+         into a single condition vector.
+
+Record schema (msgpack):
+  target_path     : str
+  class_id        : int
+  supports_pooled : bytes  (1, D) float16  — mean-pooled CLS of supports
+  supports_seq    : bytes  (k, P, D) float16  — stacked patch tokens of supports
+                           empty bytes when --no-keep_patches is set
 
 Designed for Kaggle TPU v5e-8.
 
 Usage:
-    !python prepare_data.py --src /kaggle/input/datasets/arjunashok33/miniimagenet \
-        --dst /kaggle/working/miniimagenet_split --train 60 --val 16 --test 20
-
-    !python precompute_selfrecon_jax.py \
+    # Self-recon, SigLIP2
+    python precompute_selfrecon_jax.py \
         --data_dir /kaggle/working/miniimagenet_split \
-        --out_dir /kaggle/working/selfrecon_arecord \
-        --splits train,val \
-        --batch_size 64
+        --out_dir /kaggle/working/precomp_k0 \
+        --splits train,val --batch_size 64
+
+    # 5-shot, DINOv2, no patch tokens
+    python precompute_selfrecon_jax.py \
+        --data_dir /kaggle/working/miniimagenet_split \
+        --out_dir /kaggle/working/precomp_k5_dinov2 \
+        --splits train,val --batch_size 64 \
+        --encoder dinov2 --k 5 --no-keep_patches
 """
 
 import argparse
@@ -109,6 +131,68 @@ def make_encode_fn(model, params, emb_dim):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#  DINOv2-B encoder (HuggingFace transformers)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def create_dinov2_encoder(model_name='facebook/dinov2-base'):
+    """
+    Load DINOv2-B from HuggingFace and return a numpy-based encode function.
+
+    Returns:
+        encode_fn : callable(images: np.ndarray (N,H,W,3) float32 [0,1])
+                    → (seq: np.ndarray (N, num_patches, 768),
+                       pooled: np.ndarray (N, 768))
+        emb_dim   : int  (768 for DINOv2-B)
+        num_patches: int (256 for 224×224 / patch14)
+    """
+    try:
+        import torch
+        from transformers import AutoImageProcessor, AutoModel
+    except ImportError:
+        raise ImportError(
+            "Install transformers & torch: pip install transformers torch"
+        )
+
+    print(f"Loading DINOv2 '{model_name}' from HuggingFace…")
+    processor = AutoImageProcessor.from_pretrained(model_name)
+    hf_model = AutoModel.from_pretrained(model_name)
+    hf_model.eval()
+
+    # Use GPU if available, else CPU
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    hf_model = hf_model.to(device)
+    print(f"  DINOv2 running on: {device}")
+
+    emb_dim = hf_model.config.hidden_size          # 768
+    patch_size = hf_model.config.patch_size         # 14
+    # num_patches depends on image_size set later; we'll compute dynamically
+
+    def encode_fn_dinov2(images: np.ndarray):
+        """
+        images: (N, H, W, 3) float32 in [0, 1].
+        Returns (seq, pooled) as np.ndarray float32.
+        """
+        # Convert [0,1] → uint8 PIL images expected by processor
+        imgs_pil = [
+            Image.fromarray((img * 255).astype(np.uint8))
+            for img in images
+        ]
+        inputs = processor(images=imgs_pil, return_tensors='pt')
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+
+        with torch.no_grad():
+            out = hf_model(**inputs)
+
+        # last_hidden_state: (N, 1 + num_patches, emb_dim)
+        hidden = out.last_hidden_state.cpu().numpy()   # (N, 1+P, D)
+        pooled = hidden[:, 0, :]                        # CLS  (N, D)
+        seq = hidden[:, 1:, :]                          # patches (N, P, D)
+        return seq, pooled
+
+    return encode_fn_dinov2, emb_dim, patch_size
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #  Image loading
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -150,36 +234,66 @@ def load_and_preprocess_target(path, image_size=224):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  Self-reconstruction record creation
+#  Record building — k-shot + self-recon
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def serialize_selfrecon_record(target_path, class_id, cls_token, patch_tokens):
+def _encode_all(paths, encode_fn, batch_size, image_size, keep_patches):
     """
-    Serialize a self-reconstruction record.
+    Encode a list of image paths in batches.
+    Returns:
+        cls_tokens   : np.ndarray (N, D)      float32
+        patch_tokens : np.ndarray (N, P, D)   float32  or None
+    """
+    all_cls, all_patches = [], []
+    for i in range(0, len(paths), batch_size):
+        batch = np.stack([
+            load_and_preprocess(p, image_size) for p in paths[i:i + batch_size]
+        ])
+        seq, pooled = encode_fn(batch)
+        all_cls.append(np.array(pooled))
+        if keep_patches:
+            all_patches.append(np.array(seq))
+    cls_tokens = np.concatenate(all_cls, axis=0)          # (N, D)
+    patch_tokens = np.concatenate(all_patches, axis=0) if keep_patches else None
+    return cls_tokens, patch_tokens
 
-    The condition is the same image's SigLIP2 CLS + patch tokens.
-    We store:
-      - target_path: str
-      - class_id: int
-      - supports_pooled: bytes (1, 768) float16 — CLS token as "1-shot pooled"
-      - supports_seq: bytes (1, 196, 768) float16 — patch tokens
+
+def _make_record(target_path, class_id, support_cls, support_patches):
     """
-    # Shape: (1, 768) — single "support" that IS the target
-    pooled = cls_token.reshape(1, -1).astype(np.float16)
-    # Shape: (1, 196, 768)
-    seq = patch_tokens.reshape(1, patch_tokens.shape[-2], -1).astype(np.float16)
+    Pack one record.
+
+    Args:
+        support_cls     : (k, D) float32  — CLS tokens of k support images
+                          (k=1 for self-recon)
+        support_patches : (k, P, D) float32  or None
+    Returns bytes (msgpack).
+    """
+    pooled_cond = support_cls.mean(axis=0, keepdims=True).astype(np.float16)  # (1, D)
+    if support_patches is not None:
+        # (k, P, D)  — stacked patch sequences of all supports
+        seq_cond = support_patches.astype(np.float16)
+    else:
+        seq_cond = np.zeros((0,), dtype=np.float16)  # empty placeholder
 
     record = {
         "target_path": target_path,
         "class_id": int(class_id),
-        "supports_pooled": pooled.tobytes(),
-        "supports_seq": seq.tobytes(),
+        "supports_pooled": pooled_cond.tobytes(),
+        "supports_seq": seq_cond.tobytes(),
     }
     return msgpack.packb(record, use_bin_type=True)
 
 
-def build_split_selfrecon(split, data_dir, out_dir, encode_fn, batch_size, image_size):
-    """Build ArrayRecord for one split in self-reconstruction mode."""
+def build_split(split, data_dir, out_dir, encode_fn, batch_size, image_size,
+               k=0, keep_patches=True):
+    """
+    Build ArrayRecord for one split.
+
+    k=0  — self-reconstruction: image conditions on itself.
+    k>0  — few-shot: class images → non-overlapping groups of k+1;
+            each group produces k+1 records (rotating target);
+            condition = mean-pooled CLS of the k supports.
+    """
     split_dir = os.path.join(data_dir, split)
     if not os.path.isdir(split_dir):
         print(f"[Skip] split '{split}' not found at {split_dir}")
@@ -189,68 +303,75 @@ def build_split_selfrecon(split, data_dir, out_dir, encode_fn, batch_size, image
     class_names = sorted(class_images.keys())
     class_to_id = {name: i for i, name in enumerate(class_names)}
 
-    # Flatten all images
-    all_paths = []
-    all_class_ids = []
-    for cls_name in class_names:
-        cid = class_to_id[cls_name]
-        for path in class_images[cls_name]:
-            all_paths.append(path)
-            all_class_ids.append(cid)
+    set_size = k + 1  # images per group
+    mode = "self-recon" if k == 0 else f"{k}-shot"
+    print(f"[{split}] {len(class_names)} classes | mode={mode} | keep_patches={keep_patches}")
 
-    total = len(all_paths)
-    print(f"[{split}] {len(class_names)} classes, {total} images")
-
-    # Encode all images in batches
-    all_cls_tokens = []
-    all_patch_tokens = []
-
-    for i in tqdm(range(0, total, batch_size), desc=f"encode-{split}"):
-        batch_paths = all_paths[i:i + batch_size]
-        batch_imgs = np.stack([
-            load_and_preprocess(p, image_size) for p in batch_paths
-        ])
-        seq, pooled = encode_fn(batch_imgs)
-        all_cls_tokens.append(np.array(pooled))
-        all_patch_tokens.append(np.array(seq))
-
-    all_cls_tokens = np.concatenate(all_cls_tokens, axis=0)
-    all_patch_tokens = np.concatenate(all_patch_tokens, axis=0)
-    print(f"  Encoded: cls={all_cls_tokens.shape}, patches={all_patch_tokens.shape}")
-
-    # Write ArrayRecord
     os.makedirs(out_dir, exist_ok=True)
     arecord_path = os.path.join(out_dir, f"{split}.arecord")
     writer = ArrayRecordWriter(arecord_path, "group_size:1")
+    total_records = 0
 
-    for idx in tqdm(range(total), desc=f"write-{split}"):
-        record_bytes = serialize_selfrecon_record(
-            target_path=all_paths[idx],
-            class_id=all_class_ids[idx],
-            cls_token=all_cls_tokens[idx],
-            patch_tokens=all_patch_tokens[idx],
-        )
-        writer.write(record_bytes)
+    for cls_name in tqdm(class_names, desc=f"{split}-classes"):
+        class_id = class_to_id[cls_name]
+        imgs = class_images[cls_name]              # sorted list of paths
+
+        if k == 0:
+            # ── self-reconstruction ──────────────────────────────────────────
+            cls_tokens, patch_tokens = _encode_all(
+                imgs, encode_fn, batch_size, image_size, keep_patches)
+            print(f"  [{cls_name}] self-recon: {len(imgs)} images encoded")
+
+            for idx, path in enumerate(imgs):
+                sup_cls = cls_tokens[idx:idx + 1]            # (1, D)
+                sup_pat = patch_tokens[idx:idx + 1] if keep_patches else None
+                writer.write(_make_record(path, class_id, sup_cls, sup_pat))
+                total_records += 1
+
+        else:
+            # ── k-shot ───────────────────────────────────────────────────────
+            num_sets = len(imgs) // set_size
+            if num_sets == 0:
+                print(f"  [{cls_name}] WARNING: only {len(imgs)} images, "
+                      f"need {set_size} for k={k}. Skipping.")
+                continue
+            imgs = imgs[:num_sets * set_size]    # drop remainder
+
+            cls_tokens, patch_tokens = _encode_all(
+                imgs, encode_fn, batch_size, image_size, keep_patches)
+            print(f"  [{cls_name}] {num_sets} sets × {set_size} → {num_sets * set_size} records")
+
+            for s in range(num_sets):
+                set_idx = list(range(s * set_size, (s + 1) * set_size))
+                for target_pos in range(set_size):
+                    target_idx = set_idx[target_pos]
+                    support_idx = [set_idx[j] for j in range(set_size) if j != target_pos]
+
+                    sup_cls = cls_tokens[support_idx]           # (k, D)
+                    sup_pat = patch_tokens[support_idx] if keep_patches else None  # (k,P,D)
+                    writer.write(_make_record(
+                        imgs[target_idx], class_id, sup_cls, sup_pat))
+                    total_records += 1
 
     writer.close()
 
     # Metadata
     meta = {
         "split": split,
-        "mode": "self-reconstruction",
+        "mode": mode,
+        "k": k,
+        "keep_patches": keep_patches,
         "num_classes": len(class_names),
-        "num_images": total,
-        "num_supports_per_record": 1,
+        "total_records": total_records,
         "format": "arrayrecord",
         "serialization": "msgpack",
         "class_names": class_names,
     }
-    meta_path = os.path.join(out_dir, f"{split}_meta.json")
-    with open(meta_path, "w") as f:
+    with open(os.path.join(out_dir, f"{split}_meta.json"), "w") as f:
         json.dump(meta, f, indent=2)
 
     file_mb = os.path.getsize(arecord_path) / (1024 * 1024)
-    print(f"[{split}] Written {total} records → {arecord_path} ({file_mb:.1f} MB)")
+    print(f"[{split}] Written {total_records} records → {arecord_path} ({file_mb:.1f} MB)")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -259,40 +380,73 @@ def build_split_selfrecon(split, data_dir, out_dir, encode_fn, batch_size, image
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Self-reconstruction precompute: each image's SigLIP2 CLS+patches as its own condition."
+        description="k-shot precompute: build ArrayRecord from a vision encoder."
     )
     parser.add_argument('--data_dir', required=True,
                         help='Split root with train/val/test sub-dirs.')
     parser.add_argument('--out_dir', required=True,
                         help='Output directory for ArrayRecord files.')
     parser.add_argument('--splits', default='train,val',
-                        help='Comma-separated splits.')
+                        help='Comma-separated splits to process.')
     parser.add_argument('--batch_size', type=int, default=64,
-                        help='Batch size for SigLIP2 encoding.')
-    parser.add_argument('--image_size', type=int, default=224)
-    parser.add_argument('--variant', default='B/16')
+                        help='Encoding batch size.')
+    parser.add_argument('--image_size', type=int, default=224,
+                        help='Resize images to this resolution.')
+    parser.add_argument('--variant', default='B/16',
+                        help='SigLIP2 variant (ignored for DINOv2).')
+    parser.add_argument(
+        '--encoder', default='siglip2', choices=['siglip2', 'dinov2'],
+        help='Vision encoder: siglip2 (JAX, default) or dinov2 (HuggingFace).',
+    )
+    parser.add_argument(
+        '--k', type=int, default=0,
+        help=(
+            'Number of support images per record. '
+            'k=0: self-reconstruction (image conditions on itself). '
+            'k>0: few-shot; each class is split into non-overlapping groups '
+            'of k+1 images, producing k+1 records per group by rotating the target.'
+        ),
+    )
+    parser.add_argument(
+        '--keep_patches', default=True,
+        action=argparse.BooleanOptionalAction,
+        help='Store patch token sequences in records (default: True). '
+             'Use --no-keep_patches to save space when only CLS is needed.',
+    )
     args = parser.parse_args()
 
     print(f"JAX devices: {jax.devices()}")
     print(f"Num devices: {jax.device_count()}")
+    print(f"Encoder     : {args.encoder}")
+    print(f"k           : {args.k}")
+    print(f"keep_patches: {args.keep_patches}")
 
-    # Create encoder
-    model, params, emb_dim = create_siglip2_jax(args.variant, args.image_size)
-    encode_fn = make_encode_fn(model, params, emb_dim)
+    # ── Build encoder ────────────────────────────────────────────────────────
+    if args.encoder == 'siglip2':
+        model, params, emb_dim = create_siglip2_jax(args.variant, args.image_size)
+        encode_fn = make_encode_fn(model, params, emb_dim)
+        print("Warmup JIT (SigLIP2)…")
+        dummy = np.zeros((1, args.image_size, args.image_size, 3), dtype=np.float32)
+        _ = encode_fn(dummy)
+        print("Warmup done.")
+    elif args.encoder == 'dinov2':
+        encode_fn, emb_dim, _patch_size = create_dinov2_encoder()
+        print("Warmup DINOv2…")
+        dummy = np.zeros((1, args.image_size, args.image_size, 3), dtype=np.float32)
+        _seq, _cls = encode_fn(dummy)
+        print(f"Warmup done. patches={_seq.shape[1]}, emb_dim={emb_dim}")
+    else:
+        raise ValueError(f"Unknown encoder: {args.encoder}")
 
-    # Warmup
-    print("Warmup JIT...")
-    dummy = np.zeros((1, args.image_size, args.image_size, 3), dtype=np.float32)
-    _ = encode_fn(dummy)
-    print("Warmup done.")
-
+    # ── Process splits ───────────────────────────────────────────────────────
     for split in args.splits.split(','):
         split = split.strip()
         if split:
             t0 = time.time()
-            build_split_selfrecon(
+            build_split(
                 split, args.data_dir, args.out_dir,
                 encode_fn, args.batch_size, args.image_size,
+                k=args.k, keep_patches=args.keep_patches,
             )
             print(f"  {split} took {time.time() - t0:.1f}s")
 
