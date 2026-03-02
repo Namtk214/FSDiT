@@ -45,6 +45,22 @@ import os
 import sys
 import time
 
+# ── Early TPU conflict guard ────────────────────────────────────────────────
+# On Kaggle TPU, JAX and PyTorch (used by DINOv2) both try to claim the TPU
+# devices, causing a SIGSEGV.  We detect --encoder dinov2 from sys.argv
+# *before* importing JAX so we can redirect JAX to CPU, leaving the TPU free
+# for PyTorch to ignore (it will use CPU anyway since no CUDA present).
+_encoder_early = 'siglip2'
+for _i, _a in enumerate(sys.argv):
+    if _a == '--encoder' and _i + 1 < len(sys.argv):
+        _encoder_early = sys.argv[_i + 1]
+        break
+
+if _encoder_early == 'dinov2':
+    os.environ.setdefault('JAX_PLATFORMS', 'cpu')
+    print('[info] DINOv2 mode: JAX_PLATFORMS=cpu to avoid TPU conflict.', flush=True)
+# ────────────────────────────────────────────────────────────────────────────
+
 import jax
 import jax.numpy as jnp
 import msgpack
