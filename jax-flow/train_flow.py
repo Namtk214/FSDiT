@@ -133,9 +133,12 @@ class FlowTrainer(flax.struct.PyTreeNode):
 
         # Update EMA loss
         beta = self.config.get('loss_ema_beta', 0.99)
-        new_loss_ema = beta * self.loss_ema + (1 - beta) * info['l2_loss']
-        if self.model.step == 0:  # First step
-            new_loss_ema = info['l2_loss']
+        # Use jnp.where instead of if to avoid tracer error in pmap
+        new_loss_ema = jnp.where(
+            self.model.step == 0,
+            info['l2_loss'],  # First step: use current loss
+            beta * self.loss_ema + (1 - beta) * info['l2_loss']  # Otherwise: EMA update
+        )
         info['loss_ema'] = new_loss_ema
 
         # Log learning rate (extract from optimizer state)
