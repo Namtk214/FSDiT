@@ -871,6 +871,7 @@ def main(_):
 
         if i % FLAGS.save_interval == 0 and FLAGS.save_dir is not None:
             if jax.process_index() == 0:
+                import gc
                 model_single = flax.jax_utils.unreplicate(model)
                 save_target = FLAGS.save_dir
                 save_ext = os.path.splitext(os.path.basename(save_target))[1]
@@ -879,8 +880,11 @@ def main(_):
                     save_target = os.path.join(save_target, f"checkpoint_step_{i}.pkl")
                 cp = Checkpoint(save_target, parallel=False)
                 cp.set_model(model_single)
+                del model_single  # Free unreplicated copy before serialization
+                gc.collect()      # Force garbage collection
                 cp.save()
-                del cp, model_single
+                del cp
+                gc.collect()      # Clean up after checkpoint
 
 if __name__ == '__main__':
     app.run(main)

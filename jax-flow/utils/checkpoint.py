@@ -45,11 +45,14 @@ class Checkpoint:
     def _save(self, filename):
         data = {k: (v.save() if k != 'config' else v) for k, v in self._values.items()}
         data['_timestamp'] = time.time()
-        content = pickle.dumps(data)
+
+        # Use pickle.dump() to serialize directly to file (saves RAM)
         if 'gs://' in filename:
             import tensorflow as tf
             tf.io.gfile.makedirs(os.path.dirname(filename))
             with tf.io.gfile.GFile(filename, 'wb') as f:
+                # GCS requires serialized content
+                content = pickle.dumps(data)
                 f.write(content)
         else:
             dirname = os.path.dirname(filename)
@@ -57,7 +60,8 @@ class Checkpoint:
                 os.makedirs(dirname, exist_ok=True)
             tmp = filename + '.tmp'
             with open(tmp, 'wb') as f:
-                f.write(content)
+                # Stream pickle directly to file (no RAM spike)
+                pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
             os.replace(tmp, filename)
         print('Checkpoint saved.')
 
