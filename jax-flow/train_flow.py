@@ -85,7 +85,7 @@ config_flags.DEFINE_config_dict('model', model_config, lock_config=False)
 ## Model Definitions.
 ##############################################
 
-def estimate_dit_flops_per_step(batch_size, image_size, patch_size, hidden_size, depth, num_heads, mlp_ratio, in_channels=4):
+def estimate_dit_flops_per_step(batch_size, image_size, patch_size, hidden_size, depth, num_heads, mlp_ratio, in_channels=4, use_gram_branch=False, gram_rank=64):
     """
     Estimate FLOPs per training step (forward + backward + optimizer) for DiT model.
 
@@ -98,6 +98,8 @@ def estimate_dit_flops_per_step(batch_size, image_size, patch_size, hidden_size,
         num_heads: Number of attention heads
         mlp_ratio: MLP expansion ratio
         in_channels: Number of input channels
+        use_gram_branch: Whether Gram branch is enabled
+        gram_rank: Low-rank dimension r for Gram branch
 
     Returns:
         F_step: Estimated FLOPs per training step
@@ -148,6 +150,24 @@ def estimate_dit_flops_per_step(batch_size, image_size, patch_size, hidden_size,
     # - MLP: Dense(D -> mlp_ratio*D) + Dense(mlp_ratio*D -> D)
     mlp_dim = int(mlp_ratio * D)
     per_block_flops += 2 * batch_size * N * (D * mlp_dim + mlp_dim * D)
+
+    # 3. Gram branch (ADDITIVE if enabled)
+    if use_gram_branch:
+        r = gram_rank
+        # G = X · X_t^T: (B, N, D) @ (B, D, N) → (B, N, N)
+        gram_matrix_flops = 2 * batch_size * N * N * D
+
+        # Rg = G · A · B:
+        # - G @ A: (B, N, N) @ (N, r) → (B, N, r)
+        # - (G@A) @ B: (B, N, r) @ (r, D) → (B, N, D)
+        gram_proj_flops = 2 * batch_size * N * N * r + 2 * batch_size * N * r * D
+
+        # RMSNorm: ~B*N*D (negligible compared to matmul)
+        gram_norm_flops = batch_size * N * D
+
+        # Total Gram FLOPs per block
+        gram_flops_per_block = gram_matrix_flops + gram_proj_flops + gram_norm_flops
+        per_block_flops += gram_flops_per_block
 
     # Total for all blocks
     transformer_flops = depth * per_block_flops
@@ -493,10 +513,21 @@ def main(_):
         depth=FLAGS.model.depth,
         num_heads=FLAGS.model.num_heads,
         mlp_ratio=FLAGS.model.mlp_ratio,
-        in_channels=FLAGS.model.image_channels
+        in_channels=FLAGS.model.image_channels,
+        use_gram_branch=FLAGS.model.use_gram_branch,
+        gram_rank=FLAGS.model.gram_rank
     )
     print(f"Estimated FLOPs per step: {F_step:.2e}")
     print(f"Estimated TFLOPs per step: {F_step / 1e12:.4f}")
+
+    if FLAGS.model.use_gram_branch:
+        # Estimate Gram overhead
+        N = (FLAGS.model.image_size // FLAGS.model.patch_size) ** 2
+        D = FLAGS.model.hidden_size
+        r = FLAGS.model.gram_rank
+        gram_flops_per_block = FLAGS.batch_size * N * (2*N*D + 2*N*r + 2*r*D + D)
+        gram_total = gram_flops_per_block * FLAGS.model.depth * 3.0  # forward+backward+opt
+        print(f"Gram branch overhead: {gram_total/1e12:.4f} TFLOPs ({gram_total/F_step*100:.1f}% of total)")
 
     tx           = optax.adam(learning_rate=FLAGS.model['lr'], b1=FLAGS.model['beta1'], b2=FLAGS.model['beta2'])
     model_ts     = TrainState.create(model_def, params, tx=tx)
