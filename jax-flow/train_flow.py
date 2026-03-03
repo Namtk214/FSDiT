@@ -373,10 +373,15 @@ def main(_):
         if i % FLAGS.save_interval == 0 and FLAGS.save_dir is not None:
             if jax.process_index() == 0:
                 model_single = flax.jax_utils.unreplicate(model)
-                cp = Checkpoint(FLAGS.save_dir, parallel=False)
+                save_target = FLAGS.save_dir
+                save_ext = os.path.splitext(os.path.basename(save_target))[1]
+                if save_target.endswith("/") or not save_ext:
+                    os.makedirs(save_target, exist_ok=True)
+                    save_target = os.path.join(save_target, f"checkpoint_step_{i}.pkl")
+                cp = Checkpoint(save_target, parallel=False)
                 cp.set_model(model_single)
                 cp.save()
-            del cp, model_single
+                del cp, model_single
 
 if __name__ == '__main__':
     app.run(main)
