@@ -289,7 +289,7 @@ def main(_):
 
         _, valid_info = model.update(valid_images, valid_labels)
         if jax.process_index() == 0:
-            valid_info_np = jax.tree_map(lambda x: float(np.array(x).mean()), valid_info)
+            valid_info_np = jax.tree.map(lambda x: float(np.array(x).mean()), valid_info)
             val_metrics = {
                 'val/loss': valid_info_np['l2_loss'],
                 'val/v_abs_mean': valid_info_np['v_abs_mean'],
@@ -349,8 +349,8 @@ def main(_):
         step_time = time.time() - step_start_time
 
         if i % FLAGS.log_interval == 0:
-            update_info = jax.tree_map(lambda x: np.array(x), update_info)
-            update_info = jax.tree_map(lambda x: x.mean(), update_info)
+            update_info = jax.tree.map(lambda x: np.array(x), update_info)
+            update_info = jax.tree.map(lambda x: x.mean(), update_info)
 
             # Build comprehensive training metrics
             train_metrics = {
