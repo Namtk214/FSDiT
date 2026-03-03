@@ -30,10 +30,12 @@ FLAGS = flags.FLAGS
 flags.DEFINE_string('data_dir', '/kaggle/input/datasets/arjunashok33/miniimagenet', 'Dataset directory.')
 flags.DEFINE_string('load_dir', None, 'Load checkpoint dir.')
 flags.DEFINE_string('save_dir', None, 'Save checkpoint dir.')
-flags.DEFINE_string('fid_stats', None, 'FID stats file.')
+flags.DEFINE_string('fid_stats', None, 'FID stats file. If None, will auto-generate from validation set.')
 flags.DEFINE_integer('seed', np.random.choice(1000000), 'Random seed.')
 flags.DEFINE_integer('log_interval', 1000, 'Logging interval.')
 flags.DEFINE_integer('eval_interval', 50000, 'Eval interval.')
+flags.DEFINE_integer('fid_interval', 50000, 'FID evaluation interval. Set to 0 to disable.')
+flags.DEFINE_integer('fid_num_samples', 1000, 'Number of samples to generate for FID.')
 flags.DEFINE_integer('save_interval', 200000, 'Save interval.')
 flags.DEFINE_integer('batch_size', 256, 'Mini batch size.')
 flags.DEFINE_integer('max_steps', int(1_000_000), 'Number of training steps.')
@@ -81,12 +83,189 @@ config_flags.DEFINE_config_dict('model', model_config, lock_config=False)
 ## Model Definitions.
 ##############################################
 
+def estimate_dit_flops_per_step(batch_size, image_size, patch_size, hidden_size, depth, num_heads, mlp_ratio, in_channels=4):
+    """
+    Estimate FLOPs per training step (forward + backward + optimizer) for DiT model.
+
+    Args:
+        batch_size: Training batch size
+        image_size: Input image size (H=W)
+        patch_size: Patch size
+        hidden_size: Hidden dimension D
+        depth: Number of transformer layers
+        num_heads: Number of attention heads
+        mlp_ratio: MLP expansion ratio
+        in_channels: Number of input channels
+
+    Returns:
+        F_step: Estimated FLOPs per training step
+    """
+    N = (image_size // patch_size) ** 2  # Number of patches
+    D = hidden_size
+
+    # Patch embedding: Conv2d with kernel=patch_size, stride=patch_size
+    # FLOPs = 2 * output_size * kernel_ops
+    # output_size = N (number of patches)
+    # kernel_ops = patch_size * patch_size * in_channels * D
+    patch_embed_flops = 2 * batch_size * N * (patch_size * patch_size * in_channels * D)
+
+    # Timestep embedding: 2 Dense layers (256 -> D -> D)
+    timestep_flops = 2 * batch_size * (2 * 256 * D + 2 * D * D)
+
+    # Label/Support embedding: Embedding lookup or MLP (assume MLP with 2 layers)
+    label_flops = 2 * batch_size * (2 * D * D * 2)  # Approximate
+
+    # Per DiTBlock:
+    per_block_flops = 0
+
+    # 1. Attention path
+    # - LayerNorm: ~2ND (negligible, skip)
+    # - Modulation MLP (c -> 6D): 2 * batch_size * D * 6D
+    per_block_flops += 2 * batch_size * D * (6 * D)
+
+    # - QKV projection: 3 separate Dense(D -> D) on N tokens
+    per_block_flops += 2 * batch_size * N * 3 * D * D
+
+    # - Attention computation: Q @ K^T: (B, H, N, d) @ (B, H, d, N) -> (B, H, N, N)
+    #   FLOPs = B * H * N * N * d * 2
+    head_dim = D // num_heads
+    per_block_flops += 2 * batch_size * num_heads * N * N * head_dim
+
+    # - Softmax: ~5N^2 per head (approximate)
+    per_block_flops += 5 * batch_size * num_heads * N * N
+
+    # - Attention @ V: (B, H, N, N) @ (B, H, N, d) -> (B, H, N, d)
+    per_block_flops += 2 * batch_size * num_heads * N * N * head_dim
+
+    # - Output projection: Dense(D -> D) on N tokens
+    per_block_flops += 2 * batch_size * N * D * D
+
+    # 2. MLP path
+    # - LayerNorm: negligible
+    # - Modulation: already counted above (6D output includes both gates)
+    # - MLP: Dense(D -> mlp_ratio*D) + Dense(mlp_ratio*D -> D)
+    mlp_dim = int(mlp_ratio * D)
+    per_block_flops += 2 * batch_size * N * (D * mlp_dim + mlp_dim * D)
+
+    # Total for all blocks
+    transformer_flops = depth * per_block_flops
+
+    # Final layer
+    # - LayerNorm + Modulation: 2 * batch_size * D * 2D
+    # - Dense(D -> patch_size^2 * in_channels) on N tokens
+    out_dim = patch_size * patch_size * in_channels
+    final_flops = 2 * batch_size * D * (2 * D) + 2 * batch_size * N * D * out_dim
+
+    # Total forward FLOPs
+    F_fwd = patch_embed_flops + timestep_flops + label_flops + transformer_flops + final_flops
+
+    # Training step: forward + backward (2x forward) + optimizer (~0.2x forward)
+    # Use conservative estimate: F_step = 3 * F_fwd
+    F_step = 3.0 * F_fwd
+
+    return F_step
+
 def get_x_t(images, eps, t):
     t = jnp.clip(t, 0, 1 - 0.01)
     return (1 - t) * eps + t * images
 
 def get_v(images, eps):
     return images - eps
+
+def create_fid_stats_from_dataset(data_dir, is_train, num_samples, device_count,
+                                   vae_encode_pmap, vae_rng, vae_decode_pmap,
+                                   use_stable_vae, get_fid_activations):
+    """
+    Create FID statistics from validation dataset (creates separate iterator).
+
+    Args:
+        data_dir: Dataset directory
+        is_train: Whether to use train or val split
+        num_samples: Number of samples to use for computing stats
+        device_count: Number of devices for pmap
+        vae_encode_pmap: VAE encode function (if using stable VAE)
+        vae_rng: Random key for VAE
+        vae_decode_pmap: VAE decode function (pmap version)
+        use_stable_vae: Whether using stable VAE
+        get_fid_activations: InceptionV3 feature extraction function
+
+    Returns:
+        (mu, sigma): Mean and covariance of InceptionV3 features
+    """
+    print(f"Creating FID stats from {num_samples} validation samples...")
+
+    # Create temporary dataset iterator for FID stats
+    split = 'train' if is_train else 'val'
+    ds_dir = os.path.join(data_dir, split)
+    dataset = tf.keras.utils.image_dataset_from_directory(
+        ds_dir, image_size=(224, 224), batch_size=None,
+        label_mode='int', shuffle=False, seed=42,
+    )
+    def preprocess(image, label):
+        image = tf.cast(image, tf.float32) / 255.0
+        image = (image - 0.5) / 0.5
+        return image, tf.cast(label, tf.int32)
+    dataset = dataset.map(preprocess, num_parallel_calls=tf.data.AUTOTUNE)
+    dataset = dataset.batch(device_count * 16, drop_remainder=False)
+    dataset = dataset.prefetch(tf.data.AUTOTUNE)
+    dataset_iter = iter(dataset.as_numpy_iterator())
+
+    all_activations = []
+    samples_collected = 0
+
+    while samples_collected < num_samples:
+        try:
+            batch_images, _ = next(dataset_iter)
+        except StopIteration:
+            break
+
+        batch_size = batch_images.shape[0]
+        # Pad to device_count if needed
+        if batch_size % device_count != 0:
+            pad_size = device_count - (batch_size % device_count)
+            batch_images = np.concatenate([batch_images, batch_images[:pad_size]], axis=0)
+
+        batch_images = batch_images.reshape((device_count, -1, *batch_images.shape[1:]))
+
+        # Encode and decode if using VAE
+        if use_stable_vae:
+            batch_images = vae_encode_pmap(vae_rng, batch_images)
+            batch_images = vae_decode_pmap(batch_images)
+
+        # Convert to [0, 1]
+        batch_images = jnp.clip(batch_images * 0.5 + 0.5, 0, 1)
+
+        # Resize to 256x256 for InceptionV3
+        batch_images_flat = np.array(batch_images).reshape(-1, *batch_images.shape[2:])
+        if batch_images_flat.shape[1] != 256:
+            batch_images_tf = tf.constant(batch_images_flat)
+            batch_images_resized = tf.image.resize(batch_images_tf, [256, 256], method='bilinear')
+            batch_images_flat = np.array(batch_images_resized)
+
+        # Convert to [-1, 1] for InceptionV3
+        batch_images_flat = batch_images_flat * 2.0 - 1.0
+
+        # Extract features
+        batch_images_pmap = batch_images_flat.reshape((device_count, -1, 256, 256, 3))
+        activations = get_fid_activations(batch_images_pmap)
+        activations = np.array(activations).reshape(-1, 2048)
+
+        # Collect activations
+        remaining = num_samples - samples_collected
+        activations = activations[:min(len(activations), remaining)]
+        all_activations.append(activations)
+        samples_collected += len(activations)
+
+        if samples_collected % 500 == 0 or samples_collected >= num_samples:
+            print(f"  Collected {samples_collected}/{num_samples} samples for FID stats")
+
+    # Concatenate and compute statistics
+    all_activations = np.concatenate(all_activations, axis=0)[:num_samples]
+    mu = np.mean(all_activations, axis=0)
+    sigma = np.cov(all_activations, rowvar=False)
+
+    print(f"FID stats created: mu shape {mu.shape}, sigma shape {sigma.shape}")
+    return mu, sigma
 
 class FlowTrainer(flax.struct.PyTreeNode):
     rng: Any
@@ -195,7 +374,8 @@ def main(_):
 
     # Create wandb logger
     if jax.process_index() == 0:
-        setup_wandb(FLAGS.model.to_dict(), **FLAGS.wandb)
+        wandb_config = FLAGS.model.to_dict()
+        setup_wandb(wandb_config, **FLAGS.wandb)
 
     def get_dataset(is_train):
         split   = 'train' if (is_train or FLAGS.debug_overfit) else 'val'
@@ -244,7 +424,22 @@ def main(_):
     example_t     = jnp.zeros((1,))
     example_label = jnp.zeros((1,), dtype=jnp.int32)
     params = model_def.init({'params': param_key, 'label_dropout': dropout_key}, example_obs, example_t, example_label)['params']
-    print("Total num of parameters:", sum(x.size for x in jax.tree_util.tree_leaves(params)))
+    total_params = sum(x.size for x in jax.tree_util.tree_leaves(params))
+    print("Total num of parameters:", total_params)
+
+    # Estimate FLOPs per training step
+    F_step = estimate_dit_flops_per_step(
+        batch_size=FLAGS.batch_size,
+        image_size=FLAGS.model.image_size,
+        patch_size=FLAGS.model.patch_size,
+        hidden_size=FLAGS.model.hidden_size,
+        depth=FLAGS.model.depth,
+        num_heads=FLAGS.model.num_heads,
+        mlp_ratio=FLAGS.model.mlp_ratio,
+        in_channels=FLAGS.model.image_channels
+    )
+    print(f"Estimated FLOPs per step: {F_step:.2e}")
+    print(f"Estimated TFLOPs per step: {F_step / 1e12:.4f}")
 
     tx           = optax.adam(learning_rate=FLAGS.model['lr'], b1=FLAGS.model['beta1'], b2=FLAGS.model['beta2'])
     model_ts     = TrainState.create(model_def, params, tx=tx)
@@ -257,20 +452,152 @@ def main(_):
         print("Loaded model with step", model.model.step)
         del cp
 
-    if FLAGS.fid_stats is not None:
+    # Setup FID evaluation
+    fid_enabled = FLAGS.fid_interval > 0
+    if fid_enabled:
         from utils.fid import get_fid_network, fid_from_stats
         get_fid_activations = get_fid_network()
-        truth_fid_stats     = np.load(FLAGS.fid_stats)
+
+        # Load or create FID stats
+        if FLAGS.fid_stats is not None and os.path.exists(FLAGS.fid_stats):
+            print(f"Loading FID stats from {FLAGS.fid_stats}")
+            truth_fid_stats = np.load(FLAGS.fid_stats)
+            fid_mu_real = truth_fid_stats['mu']
+            fid_sigma_real = truth_fid_stats['sigma']
+        else:
+            print("FID stats not found. Will create from validation set...")
+            fid_mu_real = None
+            fid_sigma_real = None
+
+    # Log model info to wandb
+    if jax.process_index() == 0:
+        wandb.log({
+            'model/num_params': total_params,
+            'model/trainable_params': total_params,
+            'model/estimated_tflops_per_step': F_step / 1e12,
+        }, step=0)
 
     model = flax.jax_utils.replicate(model, devices=jax.local_devices())
     model = model.replace(rng=jax.random.split(rng, len(jax.local_devices())))
     jax.debug.visualize_array_sharding(model.model.params['FinalLayer_0']['Dense_0']['bias'])
+
+    # Create FID stats if needed (only on process 0)
+    if fid_enabled and fid_mu_real is None and jax.process_index() == 0:
+        print("Creating FID reference statistics from validation set...")
+        fid_mu_real, fid_sigma_real = create_fid_stats_from_dataset(
+            data_dir=FLAGS.data_dir,
+            is_train=False,
+            num_samples=5000,
+            device_count=device_count,
+            vae_encode_pmap=vae_encode_pmap if FLAGS.model.use_stable_vae else None,
+            vae_rng=vae_rng if FLAGS.model.use_stable_vae else None,
+            vae_decode_pmap=vae_decode_pmap if FLAGS.model.use_stable_vae else None,
+            use_stable_vae=FLAGS.model.use_stable_vae,
+            get_fid_activations=get_fid_activations
+        )
+        # Save for future use
+        if FLAGS.save_dir is not None:
+            fid_stats_path = os.path.join(FLAGS.save_dir, 'fid_stats.npz')
+            os.makedirs(FLAGS.save_dir, exist_ok=True)
+            np.savez(fid_stats_path, mu=fid_mu_real, sigma=fid_sigma_real)
+            print(f"Saved FID stats to {fid_stats_path}")
+    elif fid_enabled and fid_mu_real is None:
+        # Wait for process 0 to create stats
+        import time
+        fid_stats_path = os.path.join(FLAGS.save_dir, 'fid_stats.npz') if FLAGS.save_dir else None
+        if fid_stats_path:
+            while not os.path.exists(fid_stats_path):
+                time.sleep(5)
+            truth_fid_stats = np.load(fid_stats_path)
+            fid_mu_real = truth_fid_stats['mu']
+            fid_sigma_real = truth_fid_stats['sigma']
+            print(f"Loaded FID stats from {fid_stats_path}")
 
     valid_images_small, _ = next(dataset_valid)
     valid_images_small    = valid_images_small[:device_count, None]
     visualize_labels      = example_labels.reshape((device_count, -1, *example_labels.shape[1:]))[:, 0:1]
     if FLAGS.model.use_stable_vae:
         valid_images_small = vae_encode_pmap(vae_rng, valid_images_small)
+
+    ###################################
+    # FID Evaluation Function
+    ###################################
+    def compute_fid(step):
+        """Generate samples and compute FID score."""
+        if not fid_enabled or jax.process_index() != 0:
+            return None
+
+        print(f"[Step {step}] Computing FID...")
+        num_fid_samples = FLAGS.fid_num_samples
+        samples_per_device = (num_fid_samples + device_count - 1) // device_count
+        samples_per_batch = min(32, samples_per_device)  # Generate in smaller batches
+        num_batches = (samples_per_device + samples_per_batch - 1) // samples_per_batch
+
+        all_generated = []
+        for batch_idx in range(num_batches):
+            batch_start = batch_idx * samples_per_batch
+            batch_end = min((batch_idx + 1) * samples_per_batch, samples_per_device)
+            actual_batch_size = batch_end - batch_start
+
+            # Sample random labels for generation
+            fid_labels = np.random.randint(0, FLAGS.model.num_classes, size=(device_count, actual_batch_size))
+
+            # Generate from noise
+            key = jax.random.PRNGKey(42 + batch_idx + step)
+            if FLAGS.model.use_stable_vae:
+                noise_shape = (device_count, actual_batch_size, FLAGS.model.image_size, FLAGS.model.image_size, FLAGS.model.image_channels)
+            else:
+                noise_shape = (device_count, actual_batch_size, 224, 224, 3)
+            eps = jax.random.normal(key, noise_shape)
+
+            # Denoise with CFG
+            x = eps
+            delta_t = 1.0 / FLAGS.model.denoise_timesteps
+            for ti in range(FLAGS.model.denoise_timesteps):
+                t_vec = jnp.full((x.shape[0], x.shape[1]), ti / FLAGS.model.denoise_timesteps)
+                x = x + model.call_model_pmap(x, t_vec, fid_labels, True, FLAGS.model.cfg_scale) * delta_t
+
+            # Decode if using VAE
+            if FLAGS.model.use_stable_vae:
+                x = vae_decode_pmap(x)
+
+            # Convert to numpy and clip to [0, 1]
+            x = np.array(x)
+            x = np.clip(x * 0.5 + 0.5, 0, 1)
+
+            # Flatten device dimension and collect
+            x = x.reshape(-1, *x.shape[2:])
+            all_generated.append(x)
+
+            if (batch_idx + 1) % 10 == 0:
+                print(f"  Generated {(batch_idx + 1) * samples_per_batch * device_count}/{num_fid_samples} samples")
+
+        # Concatenate all generated samples
+        generated_samples = np.concatenate(all_generated, axis=0)[:num_fid_samples]
+
+        # Resize to 256x256 for InceptionV3
+        if generated_samples.shape[1] != 256:
+            generated_samples_tf = tf.constant(generated_samples)
+            generated_samples_resized = tf.image.resize(generated_samples_tf, [256, 256], method='bilinear')
+            generated_samples = np.array(generated_samples_resized)
+
+        # Convert to [-1, 1] for InceptionV3
+        generated_samples = generated_samples * 2.0 - 1.0
+
+        # Extract features using InceptionV3
+        generated_samples_pmap = generated_samples.reshape((device_count, -1, 256, 256, 3))
+        activations = get_fid_activations(generated_samples_pmap)
+        activations = np.array(activations).reshape(-1, 2048)[:num_fid_samples]
+
+        # Compute statistics
+        mu_gen = np.mean(activations, axis=0)
+        sigma_gen = np.cov(activations, rowvar=False)
+
+        # Compute FID
+        fid_score = fid_from_stats(fid_mu_real, fid_sigma_real, mu_gen, sigma_gen)
+
+        print(f"[Step {step}] FID score: {fid_score:.2f}")
+        return float(fid_score)
 
     ###################################
     # Train Loop
@@ -281,6 +608,7 @@ def main(_):
         return np.array(jnp.clip(img * 0.5 + 0.5, 0, 1))
 
     def eval_model():
+        # Validation loss
         valid_images, valid_labels = next(dataset_valid)
         valid_images = valid_images.reshape((device_count, -1, *valid_images.shape[1:]))
         valid_labels = valid_labels.reshape((device_count, -1, *valid_labels.shape[1:]))
@@ -352,6 +680,9 @@ def main(_):
             update_info = jax.tree.map(lambda x: np.array(x), update_info)
             update_info = jax.tree.map(lambda x: x.mean(), update_info)
 
+            # Calculate TFLOPS
+            tflops = F_step / (step_time * 1e12)
+
             # Build comprehensive training metrics
             train_metrics = {
                 'train/loss': update_info['l2_loss'],
@@ -362,6 +693,7 @@ def main(_):
                 'train/v_abs_mean': update_info['v_abs_mean'],
                 'train/v_pred_abs_mean': update_info['v_pred_abs_mean'],
                 'perf/train_step_time': step_time,
+                'perf/tflops': tflops,
             }
 
             if jax.process_index() == 0:
@@ -369,6 +701,12 @@ def main(_):
 
         if i % FLAGS.eval_interval == 0 or i == 1000:
             eval_model()
+
+        # FID evaluation at separate interval
+        if fid_enabled and i % FLAGS.fid_interval == 0 and i > 0:
+            fid_score = compute_fid(i)
+            if fid_score is not None and jax.process_index() == 0:
+                wandb.log({'eval/FID': fid_score}, step=i)
 
         if i % FLAGS.save_interval == 0 and FLAGS.save_dir is not None:
             if jax.process_index() == 0:
