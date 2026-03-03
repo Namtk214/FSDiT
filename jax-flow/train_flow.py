@@ -3,6 +3,7 @@ enable_debug()
 
 from typing import Any
 import os
+import time
 from absl import app, flags
 from functools import partial
 import numpy as np
@@ -56,6 +57,11 @@ model_config = ml_collections.ConfigDict({
     't_conditioning': 1,
     'preset': 'big',
     'use_stable_vae': 1,
+    # Gram branch support (new)
+    'use_gram_branch': False,  # Set to True to enable Gram branch
+    'gram_rank': 64,           # Low-rank dimension for Gram branch
+    # Logging
+    'loss_ema_beta': 0.99,     # EMA smoothing factor for loss
 })
 
 preset_configs = {
@@ -87,6 +93,7 @@ class FlowTrainer(flax.struct.PyTreeNode):
     model: TrainState
     model_eps: TrainState
     config: dict = flax.struct.field(pytree_node=False)
+    loss_ema: float = 0.0  # EMA of training loss
 
     @partial(jax.pmap, axis_name='data')
     def update(self, images, labels, pmap_axis='data'):
@@ -124,11 +131,21 @@ class FlowTrainer(flax.struct.PyTreeNode):
         info['update_norm'] = optax.global_norm(updates)
         info['param_norm'] = optax.global_norm(new_params)
 
+        # Update EMA loss
+        beta = self.config.get('loss_ema_beta', 0.99)
+        new_loss_ema = beta * self.loss_ema + (1 - beta) * info['l2_loss']
+        if self.model.step == 0:  # First step
+            new_loss_ema = info['l2_loss']
+        info['loss_ema'] = new_loss_ema
+
+        # Log learning rate (extract from optimizer state)
+        info['lr'] = self.config['lr']
+
         # Update the model_eps
         new_model_eps = target_update(self.model, self.model_eps, 1-self.config['target_update_rate'])
         if self.config['target_update_rate'] == 1:
             new_model_eps = new_model
-        new_trainer = self.replace(rng=new_rng, model=new_model, model_eps=new_model_eps)
+        new_trainer = self.replace(rng=new_rng, model=new_model, model_eps=new_model_eps, loss_ema=new_loss_ema)
         return new_trainer, info
 
 
@@ -145,7 +162,7 @@ class FlowTrainer(flax.struct.PyTreeNode):
             labels_full = jnp.concatenate([labels, labels_uncond], axis=0)
             v_pred = self.model_eps(images_expanded, t_expanded, labels_full, train=False, force_drop_ids=False)
             v_label = v_pred[:images.shape[0]]
-        v_uncond = v_pred[images.shape[0]:]
+            v_uncond = v_pred[images.shape[0]:]
             v = v_uncond + cfg_val * (v_label - v_uncond)
             return v
 
@@ -218,7 +235,7 @@ def main(_):
 
     FLAGS.model.image_channels = example_obs.shape[-1]
     FLAGS.model.image_size     = example_obs.shape[1]
-    dit_args  = {k: FLAGS.model[k] for k in ['patch_size','hidden_size','depth','num_heads','mlp_ratio','class_dropout_prob','num_classes']}
+    dit_args  = {k: FLAGS.model[k] for k in ['patch_size','hidden_size','depth','num_heads','mlp_ratio','class_dropout_prob','num_classes','use_gram_branch','gram_rank']}
     model_def = DiT(**dit_args)
 
     example_t     = jnp.zeros((1,))
@@ -269,7 +286,13 @@ def main(_):
 
         _, valid_info = model.update(valid_images, valid_labels)
         if jax.process_index() == 0:
-            wandb.log({f'validation/{k}': v.mean() for k, v in valid_info.items()}, step=i)
+            valid_info_np = jax.tree_map(lambda x: float(np.array(x).mean()), valid_info)
+            val_metrics = {
+                'val/loss': valid_info_np['l2_loss'],
+                'val/v_abs_mean': valid_info_np['v_abs_mean'],
+                'val/v_pred_abs_mean': valid_info_np['v_pred_abs_mean'],
+            }
+            wandb.log(val_metrics, step=i)
 
         # One-step denoising visualization (8 devices only)
         if len(jax.local_devices()) == 8:
@@ -309,6 +332,8 @@ def main(_):
         print("Finished eval")
 
     for i in tqdm.tqdm(range(1, FLAGS.max_steps + 1), smoothing=0.1, dynamic_ncols=True):
+        step_start_time = time.time()
+
         if not FLAGS.debug_overfit or i == 1:
             batch_images, batch_labels = next(dataset)
             batch_images = batch_images.reshape((device_count, -1, *batch_images.shape[1:]))
@@ -318,10 +343,24 @@ def main(_):
 
         model, update_info = model.update(batch_images, batch_labels)
 
+        step_time = time.time() - step_start_time
+
         if i % FLAGS.log_interval == 0:
             update_info = jax.tree_map(lambda x: np.array(x), update_info)
             update_info = jax.tree_map(lambda x: x.mean(), update_info)
-            train_metrics = {f'training/{k}': v for k, v in update_info.items()}
+
+            # Build comprehensive training metrics
+            train_metrics = {
+                'train/loss': update_info['l2_loss'],
+                'train/loss_ema': update_info['loss_ema'],
+                'train/lr': update_info['lr'],
+                'train/grad_norm': update_info['grad_norm'],
+                'train/param_norm': update_info['param_norm'],
+                'train/v_abs_mean': update_info['v_abs_mean'],
+                'train/v_pred_abs_mean': update_info['v_pred_abs_mean'],
+                'perf/train_step_time': step_time,
+            }
+
             if jax.process_index() == 0:
                 wandb.log(train_metrics, step=i)
 
@@ -330,10 +369,10 @@ def main(_):
 
         if i % FLAGS.save_interval == 0 and FLAGS.save_dir is not None:
             if jax.process_index() == 0:
-            model_single = flax.jax_utils.unreplicate(model)
-            cp = Checkpoint(FLAGS.save_dir, parallel=False)
-            cp.set_model(model_single)
-            cp.save()
+                model_single = flax.jax_utils.unreplicate(model)
+                cp = Checkpoint(FLAGS.save_dir, parallel=False)
+                cp.set_model(model_single)
+                cp.save()
             del cp, model_single
 
 if __name__ == '__main__':
