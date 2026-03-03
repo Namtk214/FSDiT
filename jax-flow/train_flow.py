@@ -212,7 +212,8 @@ def create_fid_stats_from_dataset(data_dir, is_train, num_samples, device_count,
         get_fid_activations: InceptionV3 feature extraction function
 
     Returns:
-        (mu, sigma): Mean and covariance of InceptionV3 features
+        (mu, sigma, labels, num_classes): Mean and covariance of InceptionV3 features,
+                                          labels from dataset, and actual number of classes
     """
     print(f"Creating FID stats from {num_samples} validation samples...")
 
@@ -223,6 +224,11 @@ def create_fid_stats_from_dataset(data_dir, is_train, num_samples, device_count,
         ds_dir, image_size=(224, 224), batch_size=None,
         label_mode='int', shuffle=False, seed=42,
     )
+
+    # Detect number of classes from dataset
+    num_classes = len(dataset.class_names)
+    print(f"Detected {num_classes} classes in dataset: {dataset.class_names[:10]}...")
+
     def preprocess(image, label):
         image = tf.cast(image, tf.float32) / 255.0
         image = (image - 0.5) / 0.5
@@ -233,11 +239,12 @@ def create_fid_stats_from_dataset(data_dir, is_train, num_samples, device_count,
     dataset_iter = iter(dataset.as_numpy_iterator())
 
     all_activations = []
+    all_labels = []  # Collect labels for FID sampling
     samples_collected = 0
 
     while samples_collected < num_samples:
         try:
-            batch_images, _ = next(dataset_iter)
+            batch_images, batch_labels = next(dataset_iter)
         except StopIteration:
             break
 
@@ -246,6 +253,7 @@ def create_fid_stats_from_dataset(data_dir, is_train, num_samples, device_count,
         if batch_size % device_count != 0:
             pad_size = device_count - (batch_size % device_count)
             batch_images = np.concatenate([batch_images, batch_images[:pad_size]], axis=0)
+            batch_labels = np.concatenate([batch_labels, batch_labels[:pad_size]], axis=0)
 
         batch_images = batch_images.reshape((device_count, -1, *batch_images.shape[1:]))
 
@@ -272,10 +280,12 @@ def create_fid_stats_from_dataset(data_dir, is_train, num_samples, device_count,
         activations = get_fid_activations(batch_images_pmap)
         activations = np.array(activations).reshape(-1, 2048)
 
-        # Collect activations
+        # Collect activations and labels
         remaining = num_samples - samples_collected
         activations = activations[:min(len(activations), remaining)]
+        batch_labels = batch_labels[:min(len(batch_labels), remaining)]
         all_activations.append(activations)
+        all_labels.append(batch_labels)
         samples_collected += len(activations)
 
         if samples_collected % 500 == 0 or samples_collected >= num_samples:
@@ -283,11 +293,13 @@ def create_fid_stats_from_dataset(data_dir, is_train, num_samples, device_count,
 
     # Concatenate and compute statistics
     all_activations = np.concatenate(all_activations, axis=0)[:num_samples]
+    all_labels = np.concatenate(all_labels, axis=0)[:num_samples]
     mu = np.mean(all_activations, axis=0)
     sigma = np.cov(all_activations, rowvar=False)
 
     print(f"FID stats created: mu shape {mu.shape}, sigma shape {sigma.shape}")
-    return mu, sigma
+    print(f"Label distribution: {np.bincount(all_labels, minlength=num_classes)}")
+    return mu, sigma, all_labels, num_classes
 
 class FlowTrainer(flax.struct.PyTreeNode):
     rng: Any
@@ -574,6 +586,8 @@ def main(_):
 
     # Setup FID evaluation
     fid_enabled = FLAGS.fid_interval > 0
+    fid_labels_real = None
+    actual_num_classes = FLAGS.model.num_classes
     if fid_enabled:
         from utils.fid import get_fid_network, fid_from_stats
         get_fid_activations = get_fid_network()
@@ -584,6 +598,11 @@ def main(_):
             truth_fid_stats = np.load(FLAGS.fid_stats)
             fid_mu_real = truth_fid_stats['mu']
             fid_sigma_real = truth_fid_stats['sigma']
+            # Load labels and num_classes if available (for proper label sampling)
+            if 'labels' in truth_fid_stats:
+                fid_labels_real = truth_fid_stats['labels']
+                actual_num_classes = int(truth_fid_stats['num_classes'])
+                print(f"  Loaded FID labels (num_classes={actual_num_classes})")
         else:
             print("FID stats not found. Will create from validation set...")
             fid_mu_real = None
@@ -604,7 +623,7 @@ def main(_):
     # Create FID stats if needed (only on process 0)
     if fid_enabled and fid_mu_real is None and jax.process_index() == 0:
         print("Creating FID reference statistics from validation set...")
-        fid_mu_real, fid_sigma_real = create_fid_stats_from_dataset(
+        fid_mu_real, fid_sigma_real, fid_labels_real, actual_num_classes = create_fid_stats_from_dataset(
             data_dir=FLAGS.data_dir,
             is_train=False,
             num_samples=5000,
@@ -619,8 +638,9 @@ def main(_):
         if FLAGS.save_dir is not None:
             fid_stats_path = os.path.join(FLAGS.save_dir, 'fid_stats.npz')
             os.makedirs(FLAGS.save_dir, exist_ok=True)
-            np.savez(fid_stats_path, mu=fid_mu_real, sigma=fid_sigma_real)
-            print(f"Saved FID stats to {fid_stats_path}")
+            np.savez(fid_stats_path, mu=fid_mu_real, sigma=fid_sigma_real,
+                     labels=fid_labels_real, num_classes=actual_num_classes)
+            print(f"Saved FID stats to {fid_stats_path} (num_classes={actual_num_classes})")
     elif fid_enabled and fid_mu_real is None:
         # Wait for process 0 to create stats
         fid_stats_path = os.path.join(FLAGS.save_dir, 'fid_stats.npz') if FLAGS.save_dir else None
@@ -630,7 +650,15 @@ def main(_):
             truth_fid_stats = np.load(fid_stats_path)
             fid_mu_real = truth_fid_stats['mu']
             fid_sigma_real = truth_fid_stats['sigma']
-            print(f"Loaded FID stats from {fid_stats_path}")
+            fid_labels_real = truth_fid_stats['labels']
+            actual_num_classes = int(truth_fid_stats['num_classes'])
+            print(f"Loaded FID stats from {fid_stats_path} (num_classes={actual_num_classes})")
+
+    # Warn if model num_classes doesn't match actual dataset classes
+    if fid_enabled and actual_num_classes != FLAGS.model.num_classes:
+        print(f"WARNING: Model num_classes ({FLAGS.model.num_classes}) != actual dataset classes ({actual_num_classes})")
+        print(f"  Recommend setting --model.num_classes={actual_num_classes}")
+        print(f"  FID will use actual classes from dataset: {actual_num_classes}")
 
     valid_images_small, _ = next(dataset_valid)
     valid_images_small    = valid_images_small[:device_count, None]
@@ -658,8 +686,14 @@ def main(_):
             batch_end = min((batch_idx + 1) * samples_per_batch, samples_per_device)
             actual_batch_size = batch_end - batch_start
 
-            # Sample random labels for generation
-            fid_labels = np.random.randint(0, FLAGS.model.num_classes, size=(device_count, actual_batch_size))
+            # Sample labels from real dataset distribution (same as reference stats)
+            # This ensures generated and real samples have same class distribution
+            batch_labels = []
+            for _ in range(device_count):
+                # Random indices into fid_labels_real
+                indices = np.random.choice(len(fid_labels_real), size=actual_batch_size, replace=True)
+                batch_labels.append(fid_labels_real[indices])
+            fid_labels = np.array(batch_labels)
 
             # Generate from noise
             key = jax.random.PRNGKey(42 + batch_idx + step)
@@ -669,20 +703,24 @@ def main(_):
                 noise_shape = (device_count, actual_batch_size, 224, 224, 3)
             eps = jax.random.normal(key, noise_shape)
 
-            # Denoise with CFG
+            # Denoise with CFG using Euler method with midpoint (better integration)
+            # Flow ODE: dx/dt = v(x,t), integrate from t=0 (noise) to t=1 (data)
             x = eps
             delta_t = 1.0 / FLAGS.model.denoise_timesteps
             for ti in range(FLAGS.model.denoise_timesteps):
-                t_vec = jnp.full((x.shape[0], x.shape[1]), ti / FLAGS.model.denoise_timesteps)
-                x = x + model.call_model_pmap(x, t_vec, fid_labels, True, FLAGS.model.cfg_scale) * delta_t
+                # Use midpoint for better accuracy: t = (ti + 0.5) / N
+                # This properly integrates from t=0 to t=1
+                t_vec = jnp.full((x.shape[0], x.shape[1]), (ti + 0.5) / FLAGS.model.denoise_timesteps)
+                v = model.call_model_pmap(x, t_vec, fid_labels, True, FLAGS.model.cfg_scale)
+                x = x + v * delta_t
 
             # Decode if using VAE
             if FLAGS.model.use_stable_vae:
                 x = vae_decode_pmap(x)
 
-            # Convert to numpy and clip to [0, 1]
+            # Clip to [-1, 1] (same range as model output)
             x = np.array(x)
-            x = np.clip(x * 0.5 + 0.5, 0, 1)
+            x = np.clip(x, -1.0, 1.0)
 
             # Flatten device dimension and collect
             x = x.reshape(-1, *x.shape[2:])
@@ -694,13 +732,16 @@ def main(_):
         # Concatenate all generated samples
         generated_samples = np.concatenate(all_generated, axis=0)[:num_fid_samples]
 
+        # Convert to [0, 1] for resizing
+        generated_samples = np.clip(generated_samples * 0.5 + 0.5, 0, 1)
+
         # Resize to 256x256 for InceptionV3
         if generated_samples.shape[1] != 256:
             generated_samples_tf = tf.constant(generated_samples)
             generated_samples_resized = tf.image.resize(generated_samples_tf, [256, 256], method='bilinear')
             generated_samples = np.array(generated_samples_resized)
 
-        # Convert to [-1, 1] for InceptionV3
+        # Convert back to [-1, 1] for InceptionV3
         generated_samples = generated_samples * 2.0 - 1.0
 
         # Extract features using InceptionV3
