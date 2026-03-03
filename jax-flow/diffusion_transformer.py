@@ -245,7 +245,7 @@ class DiTBlock(nn.Module):
     hidden_size: int
     num_heads: int
     mlp_ratio: float = 4.0
-    use_gram_branch: bool = False  # Enable Gram branch instead of attention residual
+    use_gram_branch: bool = True  # Enable Gram branch instead of attention residual
     gram_rank: int = 64            # Low-rank dimension for Gram branch
     debug: bool = False            # Enable debug logging
 
@@ -355,7 +355,7 @@ class DiT(nn.Module):
     cond_dropout_prob: float = 0.1
     learn_sigma: bool = False
     # Gram branch support
-    use_gram_branch: bool = False  # Enable Gram branch instead of attention residual
+    use_gram_branch: bool = True   # Enable Gram branch instead of attention residual
     gram_rank: int = 64            # Low-rank dimension for Gram branch
     debug: bool = False            # Enable debug logging
 
