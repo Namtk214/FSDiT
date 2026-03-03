@@ -297,6 +297,38 @@ class FlowTrainer(flax.struct.PyTreeNode):
     loss_ema: float = 0.0  # EMA of training loss
 
     @partial(jax.pmap, axis_name='data')
+    def evaluate(self, images, labels, pmap_axis='data'):
+        """Evaluate model WITHOUT updating params (for validation)"""
+        new_rng, label_key, time_key, noise_key = jax.random.split(self.rng, 4)
+
+        # Same loss computation as training, but NO gradient/update
+        if self.config['t_sampler'] == 'log-normal':
+            t = jax.random.normal(time_key, (images.shape[0],))
+            t = 1 / (1 + jnp.exp(-t))
+        else:
+            t = jax.random.uniform(time_key, (images.shape[0],))
+        t_full = t[:, None, None, None]
+        eps = jax.random.normal(noise_key, images.shape)
+        x_t = get_x_t(images, eps, t_full)
+        v_t = get_v(images, eps)
+        if self.config['t_conditioning'] == 0:
+            t = jnp.zeros_like(t)
+
+        # Use EMA model for evaluation (NOT training model)
+        v_prime = self.model_eps(x_t, t, labels, train=False, force_drop_ids=False)
+        loss = jnp.mean((v_prime - v_t) ** 2)
+
+        info = {
+            'l2_loss': loss,
+            'v_abs_mean': jnp.abs(v_t).mean(),
+            'v_pred_abs_mean': jnp.abs(v_prime).mean(),
+        }
+        info = jax.lax.pmean(info, axis_name=pmap_axis)
+
+        # Return info only, NO model update
+        return info
+
+    @partial(jax.pmap, axis_name='data')
     def update(self, images, labels, pmap_axis='data'):
         new_rng, label_key, time_key, noise_key = jax.random.split(self.rng, 4)
 
@@ -702,7 +734,8 @@ def main(_):
         if FLAGS.model.use_stable_vae:
             valid_images = vae_encode_pmap(vae_rng, valid_images)
 
-        _, valid_info = model.update(valid_images, valid_labels)
+        # Use evaluate() instead of update() - NO param update!
+        valid_info = model.evaluate(valid_images, valid_labels)
         if jax.process_index() == 0:
             valid_info_np = jax.tree.map(lambda x: float(np.array(x).mean()), valid_info)
             val_metrics = {
