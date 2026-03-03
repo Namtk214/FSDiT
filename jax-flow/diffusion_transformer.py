@@ -247,6 +247,7 @@ class DiTBlock(nn.Module):
     mlp_ratio: float = 4.0
     use_gram_branch: bool = False  # Enable Gram branch instead of attention residual
     gram_rank: int = 64            # Low-rank dimension for Gram branch
+    debug: bool = False            # Enable debug logging
 
     @nn.compact
     def __call__(self, x, c, return_attn=False):
@@ -269,6 +270,12 @@ class DiTBlock(nn.Module):
             num_tokens = x_modulated.shape[1]
             A = self.param('gram_A', nn.initializers.normal(0.02), (num_tokens, self.gram_rank))
             B = self.param('gram_B', nn.initializers.normal(0.02), (self.gram_rank, self.hidden_size))
+
+            # DEBUG: Add marker to verify Gram branch is used
+            if self.debug:
+                jax.debug.print("🔵 Gram Branch: A={a_shape}, B={b_shape}, Gx={gx_shape}",
+                               a_shape=A.shape, b_shape=B.shape, gx_shape=gx.shape)
+
             rx = jnp.matmul(gx, jnp.matmul(A, B))  # (B, N, N) @ (N, D) → (B, N, D)
 
             # Step D: RMSNorm
@@ -350,6 +357,22 @@ class DiT(nn.Module):
     # Gram branch support
     use_gram_branch: bool = False  # Enable Gram branch instead of attention residual
     gram_rank: int = 64            # Low-rank dimension for Gram branch
+    debug: bool = False            # Enable debug logging
+
+    def setup(self):
+        """Setup method to print configuration once"""
+        if self.debug:
+            print("\n" + "="*80)
+            print("🔧 DiT Model Configuration")
+            print("="*80)
+            print(f"Architecture: depth={self.depth}, hidden_size={self.hidden_size}, num_heads={self.num_heads}")
+            print(f"Patch size: {self.patch_size}")
+            print(f"MLP ratio: {self.mlp_ratio}")
+            if self.use_gram_branch:
+                print(f"✅ GRAM BRANCH ENABLED: rank={self.gram_rank}")
+            else:
+                print(f"❌ GRAM BRANCH DISABLED (using standard attention)")
+            print("="*80 + "\n")
 
     @nn.compact
     def __call__(self, x, t, y, train=False, force_drop_ids=None, return_attn=False):
@@ -401,7 +424,8 @@ class DiT(nn.Module):
                     self.num_heads,
                     self.mlp_ratio,
                     use_gram_branch=self.use_gram_branch,
-                    gram_rank=self.gram_rank
+                    gram_rank=self.gram_rank,
+                    debug=self.debug
                 )(x, c, return_attn=True)
                 attn_weights_all.append(attn_w)
             else:
@@ -410,7 +434,8 @@ class DiT(nn.Module):
                     self.num_heads,
                     self.mlp_ratio,
                     use_gram_branch=self.use_gram_branch,
-                    gram_rank=self.gram_rank
+                    gram_rank=self.gram_rank,
+                    debug=self.debug
                 )(x, c)
             # print("DiT: DiTBlock of shape", x.shape)
         x = FinalLayer(self.patch_size, out_channels, self.hidden_size)(x, c) # (B, num_patches, p*p*c)

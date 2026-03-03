@@ -64,6 +64,8 @@ model_config = ml_collections.ConfigDict({
     'gram_rank': 64,           # Low-rank dimension for Gram branch
     # Logging
     'loss_ema_beta': 0.99,     # EMA smoothing factor for loss
+    # Debug
+    'debug_model': False,      # Enable debug logging in DiT model
 })
 
 preset_configs = {
@@ -418,14 +420,61 @@ def main(_):
 
     FLAGS.model.image_channels = example_obs.shape[-1]
     FLAGS.model.image_size     = example_obs.shape[1]
-    dit_args  = {k: FLAGS.model[k] for k in ['patch_size','hidden_size','depth','num_heads','mlp_ratio','class_dropout_prob','num_classes','use_gram_branch','gram_rank']}
+    dit_args  = {k: FLAGS.model[k] for k in ['patch_size','hidden_size','depth','num_heads','mlp_ratio','class_dropout_prob','num_classes','use_gram_branch','gram_rank','debug_model']}
+    # Rename debug_model to debug for DiT
+    dit_args['debug'] = dit_args.pop('debug_model')
     model_def = DiT(**dit_args)
 
     example_t     = jnp.zeros((1,))
     example_label = jnp.zeros((1,), dtype=jnp.int32)
     params = model_def.init({'params': param_key, 'label_dropout': dropout_key}, example_obs, example_t, example_label)['params']
     total_params = sum(x.size for x in jax.tree_util.tree_leaves(params))
-    print("Total num of parameters:", total_params)
+
+    print("\n" + "="*80)
+    print("📊 MODEL INITIALIZATION")
+    print("="*80)
+    print(f"Total parameters: {total_params:,}")
+
+    # Detailed param breakdown
+    if FLAGS.model.use_gram_branch:
+        print(f"\n🔵 GRAM BRANCH MODE:")
+        print(f"   - Gram rank: {FLAGS.model.gram_rank}")
+        # Count Gram params
+        gram_params = 0
+        for i in range(FLAGS.model.depth):
+            block_key = f'DiTBlock_{i}'
+            if block_key in params:
+                if 'gram_A' in params[block_key] and 'gram_B' in params[block_key]:
+                    gram_A_size = params[block_key]['gram_A'].size
+                    gram_B_size = params[block_key]['gram_B'].size
+                    gram_params += gram_A_size + gram_B_size
+                    if i == 0:  # Print first block details
+                        print(f"   - Gram_A shape: {params[block_key]['gram_A'].shape} ({gram_A_size:,} params)")
+                        print(f"   - Gram_B shape: {params[block_key]['gram_B'].shape} ({gram_B_size:,} params)")
+        if gram_params > 0:
+            print(f"   - Total Gram params: {gram_params:,} ({gram_params/total_params*100:.2f}% of model)")
+        else:
+            print("   ⚠️  WARNING: No Gram parameters found! Gram branch may not be active.")
+    else:
+        print(f"\n❌ STANDARD ATTENTION MODE")
+        # Count attention params
+        attn_params = 0
+        for i in range(FLAGS.model.depth):
+            block_key = f'DiTBlock_{i}'
+            if block_key in params:
+                if 'MultiHeadDotProductAttention_0' in params[block_key]:
+                    attn_block = params[block_key]['MultiHeadDotProductAttention_0']
+                    for k, v in attn_block.items():
+                        if isinstance(v, dict):
+                            for kk, vv in v.items():
+                                if hasattr(vv, 'size'):
+                                    attn_params += vv.size
+                        elif hasattr(v, 'size'):
+                            attn_params += v.size
+        if attn_params > 0:
+            print(f"   - Total attention params: {attn_params:,} ({attn_params/total_params*100:.2f}% of model)")
+
+    print("="*80 + "\n")
 
     # Estimate FLOPs per training step
     F_step = estimate_dit_flops_per_step(
