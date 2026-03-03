@@ -243,7 +243,9 @@ class DiTBlock(nn.Module):
     Modified to support Gram branch:
     - Keeps standard self-attention residual (always computed)
     - Optionally ADDS a Gram-based residual branch (low-rank token-token interaction)
-    - Output: X1 = X + α1⊙MSA(X̃) + g⊙RMSNorm(G·A·B)  [if use_gram_branch=True]
+    - Uses SAME gate (α1) for both attention and Gram (maintains 6 gates like original DiT)
+    - Output: X1 = X + α1⊙(MSA(X̃) + RMSNorm(G·A·B))  [if use_gram_branch=True]
+            or X1 = X + α1⊙MSA(X̃)                    [if use_gram_branch=False]
 
     Can be toggled on/off via use_gram_branch parameter.
     """
@@ -256,16 +258,10 @@ class DiTBlock(nn.Module):
 
     @nn.compact
     def __call__(self, x, c, return_attn=False):
-        # Calculate adaLn modulation parameters.
+        # Calculate adaLn modulation parameters (ALWAYS 6 gates, same as original DiT)
         c = nn.silu(c)
-
-        # For Gram branch: need 1 extra gate (g) initialized to 0
-        if self.use_gram_branch:
-            c = nn.Dense(7 * self.hidden_size, kernel_init=nn.initializers.constant(0.))(c)
-            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp, gate_gram = jnp.split(c, 7, axis=-1)
-        else:
-            c = nn.Dense(6 * self.hidden_size, kernel_init=nn.initializers.constant(0.))(c)
-            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = jnp.split(c, 6, axis=-1)
+        c = nn.Dense(6 * self.hidden_size, kernel_init=nn.initializers.constant(0.))(c)
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = jnp.split(c, 6, axis=-1)
 
         # Attention path (ALWAYS computed, even with Gram branch)
         x_norm = nn.LayerNorm(use_bias=False, use_scale=False)(x)
@@ -314,14 +310,14 @@ class DiTBlock(nn.Module):
             # RMSNorm for stability
             rg_hat = RMSNorm()(rg)
 
-            # Gram residual with gate (g initialized to 0 for stability)
-            gram_residual = gate_gram[:, None] * rg_hat
+            # Gram residual with shared gate (use gate_msa, same as attention)
+            gram_residual = gate_msa[:, None] * rg_hat
 
             # DEBUG
             if self.debug:
-                jax.debug.print("🔵 Gram: G={g_shape}, A={a_shape}, B={b_shape}, gate_gram_mean={gg}",
+                jax.debug.print("🔵 Gram: G={g_shape}, A={a_shape}, B={b_shape}, gate_msa_mean={gm}",
                                g_shape=gram.shape, a_shape=A.shape, b_shape=B.shape,
-                               gg=jnp.mean(jnp.abs(gate_gram)))
+                               gm=jnp.mean(jnp.abs(gate_msa)))
 
             # Combined residual: attention + Gram
             x = x + attn_residual + gram_residual
@@ -365,7 +361,9 @@ class DiT(nn.Module):
     Modified to support Gram branch:
     - Keeps standard self-attention in all blocks
     - Optionally ADDS Gram-based low-rank residual (token-token interaction)
-    - Per block: X1 = X + attention_residual + gram_residual (if enabled)
+    - Uses SAME gates/shifts as original DiT (6 per block: γ1, β1, α1, γ2, β2, α2)
+    - Per block: X1 = X + α1⊙(MSA(X̃) + Gram(X))  [if enabled]
+                 X1 = X + α1⊙MSA(X̃)              [if disabled]
     """
     patch_size: int
     hidden_size: int
@@ -392,12 +390,14 @@ class DiT(nn.Module):
             print(f"Architecture: depth={self.depth}, hidden_size={self.hidden_size}, num_heads={self.num_heads}")
             print(f"Patch size: {self.patch_size}")
             print(f"MLP ratio: {self.mlp_ratio}")
+            print(f"Gates/block: 6 (γ1, β1, α1, γ2, β2, α2) - SAME as original DiT")
             if self.use_gram_branch:
                 print(f"✅ GRAM BRANCH ENABLED (ADDITIVE): rank={self.gram_rank}")
-                print(f"   Each block has: Attention + Gram residual")
+                print(f"   Output: X1 = X + α1⊙(MSA(X̃) + Gram(X))")
+                print(f"   Gram shares gate α1 with attention (zero-init)")
             else:
                 print(f"❌ GRAM BRANCH DISABLED (standard DiT)")
-                print(f"   Each block has: Attention only")
+                print(f"   Output: X1 = X + α1⊙MSA(X̃)")
             print("="*80 + "\n")
 
     @nn.compact
