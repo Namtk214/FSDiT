@@ -503,7 +503,6 @@ def main(_):
             print(f"Saved FID stats to {fid_stats_path}")
     elif fid_enabled and fid_mu_real is None:
         # Wait for process 0 to create stats
-        import time
         fid_stats_path = os.path.join(FLAGS.save_dir, 'fid_stats.npz') if FLAGS.save_dir else None
         if fid_stats_path:
             while not os.path.exists(fid_stats_path):
