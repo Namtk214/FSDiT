@@ -239,75 +239,95 @@ def get_2d_sincos_pos_embed(rng, embed_dim, length):
 class DiTBlock(nn.Module):
     """
     A DiT block with adaptive layer norm zero (adaLN-Zero) conditioning.
-    Modified to support Gram branch (replaces attention residual with Gram-based residual).
+
+    Modified to support Gram branch:
+    - Keeps standard self-attention residual (always computed)
+    - Optionally ADDS a Gram-based residual branch (low-rank token-token interaction)
+    - Output: X1 = X + α1⊙MSA(X̃) + g⊙RMSNorm(G·A·B)  [if use_gram_branch=True]
+
     Can be toggled on/off via use_gram_branch parameter.
     """
     hidden_size: int
     num_heads: int
     mlp_ratio: float = 4.0
-    use_gram_branch: bool = True  # Enable Gram branch instead of attention residual
-    gram_rank: int = 64            # Low-rank dimension for Gram branch
+    use_gram_branch: bool = True  # Add Gram branch (in addition to attention)
+    gram_rank: int = 64            # Low-rank dimension r for Gram branch
     debug: bool = False            # Enable debug logging
 
     @nn.compact
     def __call__(self, x, c, return_attn=False):
         # Calculate adaLn modulation parameters.
         c = nn.silu(c)
-        c = nn.Dense(6 * self.hidden_size, kernel_init=nn.initializers.constant(0.))(c)
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = jnp.split(c, 6, axis=-1)
 
-        # Attention path - with or without Gram branch
-        x_norm = nn.LayerNorm(use_bias=False, use_scale=False)(x)
-        x_modulated = modulate(x_norm, shift_msa, scale_msa)
-
+        # For Gram branch: need 1 extra gate (g) initialized to 0
         if self.use_gram_branch:
-            # GRAM BRANCH: Replace attention residual with Gram-based residual
-            # Step B: Gx = X̃1 @ X̃1.T  (token-token Gram) → (B, N, N)
-            gx = jnp.matmul(x_modulated, jnp.swapaxes(x_modulated, -1, -2))
+            c = nn.Dense(7 * self.hidden_size, kernel_init=nn.initializers.constant(0.))(c)
+            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp, gate_gram = jnp.split(c, 7, axis=-1)
+        else:
+            c = nn.Dense(6 * self.hidden_size, kernel_init=nn.initializers.constant(0.))(c)
+            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = jnp.split(c, 6, axis=-1)
 
-            # Step C: Low-rank projection Rx = Gx @ A @ B → (B, N, D)
-            # A: (N, r), B: (r, D)
-            num_tokens = x_modulated.shape[1]
+        # Attention path (ALWAYS computed, even with Gram branch)
+        x_norm = nn.LayerNorm(use_bias=False, use_scale=False)(x)
+        x_modulated = modulate(x_norm, shift_msa, scale_msa)  # X̃
+
+        # Compute attention residual
+        if return_attn:
+            # Custom attention to get weights
+            head_dim = self.hidden_size // self.num_heads
+            qkv = nn.Dense(3 * self.hidden_size, kernel_init=nn.initializers.xavier_uniform())(x_modulated)
+            q, k, v = jnp.split(qkv, 3, axis=-1)
+            q = rearrange(q, 'b n (h d) -> b h n d', h=self.num_heads)
+            k = rearrange(k, 'b n (h d) -> b h n d', h=self.num_heads)
+            v = rearrange(v, 'b n (h d) -> b h n d', h=self.num_heads)
+
+            scale = head_dim ** -0.5
+            attn_logits = jnp.einsum('bhqd,bhkd->bhqk', q, k) * scale
+            attn_weights = jax.nn.softmax(attn_logits, axis=-1)  # (B, H, Q, K)
+            attn_x = jnp.einsum('bhqk,bhkd->bhqd', attn_weights, v)
+            attn_x = rearrange(attn_x, 'b h n d -> b n (h d)')
+            attn_x = nn.Dense(self.hidden_size, kernel_init=nn.initializers.xavier_uniform())(attn_x)
+        else:
+            attn_x = nn.MultiHeadDotProductAttention(kernel_init=nn.initializers.xavier_uniform(),
+                num_heads=self.num_heads)(x_modulated, x_modulated)
+            attn_weights = None
+
+        # Apply attention residual with gate
+        attn_residual = gate_msa[:, None] * attn_x
+
+        # Gram branch (ADDITIONAL residual if enabled)
+        if self.use_gram_branch:
+            # X_t = X̃ (modulated input, recommended for stability)
+            x_t = x_modulated
+
+            # G = X · X_t^T  (token-token Gram matrix)
+            # Note: Use x (not x_modulated) for diversity, x_t for stability
+            gram = jnp.matmul(x, jnp.swapaxes(x_t, -1, -2))  # (B, N, N)
+
+            # Low-rank projection: Rg = G · A · B
+            num_tokens = x.shape[1]
             A = self.param('gram_A', nn.initializers.normal(0.02), (num_tokens, self.gram_rank))
             B = self.param('gram_B', nn.initializers.normal(0.02), (self.gram_rank, self.hidden_size))
 
-            # DEBUG: Add marker to verify Gram branch is used
+            rg = jnp.matmul(gram, jnp.matmul(A, B))  # (B, N, N) @ (N, D) → (B, N, D)
+
+            # RMSNorm for stability
+            rg_hat = RMSNorm()(rg)
+
+            # Gram residual with gate (g initialized to 0 for stability)
+            gram_residual = gate_gram[:, None] * rg_hat
+
+            # DEBUG
             if self.debug:
-                jax.debug.print("🔵 Gram Branch: A={a_shape}, B={b_shape}, Gx={gx_shape}",
-                               a_shape=A.shape, b_shape=B.shape, gx_shape=gx.shape)
+                jax.debug.print("🔵 Gram: G={g_shape}, A={a_shape}, B={b_shape}, gate_gram_mean={gg}",
+                               g_shape=gram.shape, a_shape=A.shape, b_shape=B.shape,
+                               gg=jnp.mean(jnp.abs(gate_gram)))
 
-            rx = jnp.matmul(gx, jnp.matmul(A, B))  # (B, N, N) @ (N, D) → (B, N, D)
-
-            # Step D: RMSNorm
-            rx_norm = RMSNorm()(rx)
-
-            # Step E: Residual connection with adaLN-Zero gate
-            residual_x = rx_norm
-            attn_weights = None
+            # Combined residual: attention + Gram
+            x = x + attn_residual + gram_residual
         else:
-            # STANDARD ATTENTION BRANCH (original DiT)
-            if return_attn:
-                # Custom attention to get weights
-                head_dim = self.hidden_size // self.num_heads
-                qkv = nn.Dense(3 * self.hidden_size, kernel_init=nn.initializers.xavier_uniform())(x_modulated)
-                q, k, v = jnp.split(qkv, 3, axis=-1)
-                q = rearrange(q, 'b n (h d) -> b h n d', h=self.num_heads)
-                k = rearrange(k, 'b n (h d) -> b h n d', h=self.num_heads)
-                v = rearrange(v, 'b n (h d) -> b h n d', h=self.num_heads)
-
-                scale = head_dim ** -0.5
-                attn_logits = jnp.einsum('bhqd,bhkd->bhqk', q, k) * scale
-                attn_weights = jax.nn.softmax(attn_logits, axis=-1)  # (B, H, Q, K)
-                attn_x = jnp.einsum('bhqk,bhkd->bhqd', attn_weights, v)
-                attn_x = rearrange(attn_x, 'b h n d -> b n (h d)')
-                attn_x = nn.Dense(self.hidden_size, kernel_init=nn.initializers.xavier_uniform())(attn_x)
-            else:
-                attn_x = nn.MultiHeadDotProductAttention(kernel_init=nn.initializers.xavier_uniform(),
-                    num_heads=self.num_heads)(x_modulated, x_modulated)
-                attn_weights = None
-            residual_x = attn_x
-
-        x = x + (gate_msa[:, None] * residual_x)
+            # Standard: only attention residual
+            x = x + attn_residual
 
         # MLP Residual (unchanged).
         x_norm2 = nn.LayerNorm(use_bias=False, use_scale=False)(x)
@@ -341,7 +361,11 @@ class DiT(nn.Module):
     """
     Diffusion model with a Transformer backbone.
     Supports both class-label conditioning (original) and support-set conditioning (FSDiT).
-    Modified to support Gram branch (replacing attention residual).
+
+    Modified to support Gram branch:
+    - Keeps standard self-attention in all blocks
+    - Optionally ADDS Gram-based low-rank residual (token-token interaction)
+    - Per block: X1 = X + attention_residual + gram_residual (if enabled)
     """
     patch_size: int
     hidden_size: int
@@ -355,8 +379,8 @@ class DiT(nn.Module):
     cond_dropout_prob: float = 0.1
     learn_sigma: bool = False
     # Gram branch support
-    use_gram_branch: bool = True   # Enable Gram branch instead of attention residual
-    gram_rank: int = 64            # Low-rank dimension for Gram branch
+    use_gram_branch: bool = True   # Add Gram branch (in addition to attention, not replacing)
+    gram_rank: int = 64            # Low-rank dimension r for Gram projection
     debug: bool = False            # Enable debug logging
 
     def setup(self):
@@ -369,9 +393,11 @@ class DiT(nn.Module):
             print(f"Patch size: {self.patch_size}")
             print(f"MLP ratio: {self.mlp_ratio}")
             if self.use_gram_branch:
-                print(f"✅ GRAM BRANCH ENABLED: rank={self.gram_rank}")
+                print(f"✅ GRAM BRANCH ENABLED (ADDITIVE): rank={self.gram_rank}")
+                print(f"   Each block has: Attention + Gram residual")
             else:
-                print(f"❌ GRAM BRANCH DISABLED (using standard attention)")
+                print(f"❌ GRAM BRANCH DISABLED (standard DiT)")
+                print(f"   Each block has: Attention only")
             print("="*80 + "\n")
 
     @nn.compact

@@ -436,10 +436,30 @@ def main(_):
     print(f"Total parameters: {total_params:,}")
 
     # Detailed param breakdown
+    print(f"\n📊 PARAMETER BREAKDOWN:")
+
+    # Count attention params (should ALWAYS exist)
+    attn_params = 0
+    for i in range(FLAGS.model.depth):
+        block_key = f'DiTBlock_{i}'
+        if block_key in params:
+            if 'MultiHeadDotProductAttention_0' in params[block_key]:
+                attn_block = params[block_key]['MultiHeadDotProductAttention_0']
+                for k, v in attn_block.items():
+                    if isinstance(v, dict):
+                        for kk, vv in v.items():
+                            if hasattr(vv, 'size'):
+                                attn_params += vv.size
+                    elif hasattr(v, 'size'):
+                        attn_params += v.size
+
+    if attn_params > 0:
+        print(f"✓ Attention params: {attn_params:,} ({attn_params/total_params*100:.2f}% of model)")
+    else:
+        print(f"⚠️  WARNING: No attention params found!")
+
+    # Count Gram params (only if enabled)
     if FLAGS.model.use_gram_branch:
-        print(f"\n🔵 GRAM BRANCH MODE:")
-        print(f"   - Gram rank: {FLAGS.model.gram_rank}")
-        # Count Gram params
         gram_params = 0
         for i in range(FLAGS.model.depth):
             block_key = f'DiTBlock_{i}'
@@ -449,30 +469,18 @@ def main(_):
                     gram_B_size = params[block_key]['gram_B'].size
                     gram_params += gram_A_size + gram_B_size
                     if i == 0:  # Print first block details
-                        print(f"   - Gram_A shape: {params[block_key]['gram_A'].shape} ({gram_A_size:,} params)")
-                        print(f"   - Gram_B shape: {params[block_key]['gram_B'].shape} ({gram_B_size:,} params)")
+                        print(f"\n✓ Gram branch (ADDITIVE):")
+                        print(f"  - Rank: {FLAGS.model.gram_rank}")
+                        print(f"  - Gram_A shape: {params[block_key]['gram_A'].shape} ({gram_A_size:,} params)")
+                        print(f"  - Gram_B shape: {params[block_key]['gram_B'].shape} ({gram_B_size:,} params)")
+
         if gram_params > 0:
-            print(f"   - Total Gram params: {gram_params:,} ({gram_params/total_params*100:.2f}% of model)")
+            print(f"  - Total Gram params: {gram_params:,} ({gram_params/total_params*100:.2f}% of model)")
+            print(f"\n🔵 GRAM-DiT MODE: Attention + Gram branch (both active)")
         else:
-            print("   ⚠️  WARNING: No Gram parameters found! Gram branch may not be active.")
+            print(f"\n⚠️  WARNING: use_gram_branch=True but no Gram params found!")
     else:
-        print(f"\n❌ STANDARD ATTENTION MODE")
-        # Count attention params
-        attn_params = 0
-        for i in range(FLAGS.model.depth):
-            block_key = f'DiTBlock_{i}'
-            if block_key in params:
-                if 'MultiHeadDotProductAttention_0' in params[block_key]:
-                    attn_block = params[block_key]['MultiHeadDotProductAttention_0']
-                    for k, v in attn_block.items():
-                        if isinstance(v, dict):
-                            for kk, vv in v.items():
-                                if hasattr(vv, 'size'):
-                                    attn_params += vv.size
-                        elif hasattr(v, 'size'):
-                            attn_params += v.size
-        if attn_params > 0:
-            print(f"   - Total attention params: {attn_params:,} ({attn_params/total_params*100:.2f}% of model)")
+        print(f"\n❌ Standard DiT: Attention only (no Gram branch)")
 
     print("="*80 + "\n")
 
