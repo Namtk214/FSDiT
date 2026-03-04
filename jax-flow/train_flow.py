@@ -222,7 +222,7 @@ def create_fid_stats_from_dataset(data_dir, is_train, num_samples, device_count,
     ds_dir = os.path.join(data_dir, split)
     dataset = tf.keras.utils.image_dataset_from_directory(
         ds_dir, image_size=(224, 224), batch_size=None,
-        label_mode='int', shuffle=False, seed=42,
+        label_mode='int', shuffle=True, seed=42,  # Shuffle to get balanced class distribution
     )
 
     # Detect number of classes from dataset
@@ -480,7 +480,14 @@ def main(_):
 
     rng = jax.random.PRNGKey(FLAGS.seed)
     rng, param_key, dropout_key = jax.random.split(rng, 3)
-    print("Total Memory on device:", float(jax.local_devices()[0].memory_stats()['bytes_limit']) / 1024**3, "GB")
+
+    # Print device memory if available
+    try:
+        mem_stats = jax.local_devices()[0].memory_stats()
+        if mem_stats is not None:
+            print("Total Memory on device:", float(mem_stats['bytes_limit']) / 1024**3, "GB")
+    except (TypeError, KeyError, AttributeError):
+        pass  # memory_stats() not available on this backend
 
     FLAGS.model.image_channels = example_obs.shape[-1]
     FLAGS.model.image_size     = example_obs.shape[1]
