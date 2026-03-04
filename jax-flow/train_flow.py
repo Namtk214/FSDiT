@@ -60,7 +60,7 @@ model_config = ml_collections.ConfigDict({
     'preset': 'big',
     'use_stable_vae': 1,
     # Gram branch support (new)
-    'use_gram_branch': True,   # Set to True to enable Gram branch
+    'use_gram_branch': False,   # Set to True to enable Gram branch
     'gram_rank': 64,           # Low-rank dimension for Gram branch
     # Logging
     'loss_ema_beta': 0.99,     # EMA smoothing factor for loss
