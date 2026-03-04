@@ -45,12 +45,16 @@ model_config = ml_collections.ConfigDict({
     'lr': 0.0001,
     'beta1': 0.9,
     'beta2': 0.99,
+    # Learning rate schedule
+    'warmup_steps': 500,
+    'decay_type': 'cosine',  # 'cosine' or 'linear'
+    'linear_end': 0.0,       # End lr for linear decay (ignored if cosine)
     'hidden_size': 768,
     'patch_size': 2,
     'depth': 12,
     'num_heads': 12,
     'mlp_ratio': 4,
-    'class_dropout_prob': 0.1,
+    'class_dropout_prob': 0.15,
     'num_classes': 100,
     'denoise_timesteps': 32,
     'cfg_scale': 4.0,
@@ -84,6 +88,45 @@ config_flags.DEFINE_config_dict('model', model_config, lock_config=False)
 ##############################################
 ## Model Definitions.
 ##############################################
+
+def create_learning_rate_schedule(base_lr, total_steps, warmup_steps=500, decay_type='cosine', linear_end=0.0):
+    """
+    Create learning rate schedule with warmup + decay.
+
+    Args:
+        base_lr: Peak learning rate after warmup
+        total_steps: Total training steps
+        warmup_steps: Number of linear warmup steps
+        decay_type: 'cosine' or 'linear'
+        linear_end: End learning rate for linear decay (ignored if cosine)
+
+    Returns:
+        Callable that takes step and returns learning rate
+    """
+    def lr_schedule(step):
+        # Warmup phase: linear increase from 0 to base_lr
+        warmup_factor = jnp.minimum(1.0, step / warmup_steps)
+
+        # Decay phase after warmup
+        progress = jnp.clip((step - warmup_steps) / jnp.maximum(1.0, total_steps - warmup_steps), 0.0, 1.0)
+
+        if decay_type == 'cosine':
+            # Cosine decay: lr = base_lr * 0.5 * (1 + cos(pi * progress))
+            decay_factor = 0.5 * (1.0 + jnp.cos(jnp.pi * progress))
+            lr = base_lr * decay_factor
+        elif decay_type == 'linear':
+            # Linear decay: lr = linear_end + (base_lr - linear_end) * (1 - progress)
+            lr = linear_end + (base_lr - linear_end) * (1.0 - progress)
+        else:
+            # Constant (no decay)
+            lr = base_lr
+
+        # Apply warmup
+        lr = lr * warmup_factor
+
+        return lr
+
+    return lr_schedule
 
 def estimate_dit_flops_per_step(batch_size, image_size, patch_size, hidden_size, depth, num_heads, mlp_ratio, in_channels=4, use_gram_branch=False, gram_rank=64):
     """
@@ -386,8 +429,23 @@ class FlowTrainer(flax.struct.PyTreeNode):
         )
         info['loss_ema'] = new_loss_ema
 
-        # Log learning rate (extract from optimizer state)
-        info['lr'] = self.config['lr']
+        # Log learning rate (compute from schedule using current step)
+        # Learning rate schedule is a function of step in optax
+        # Extract by calling the schedule function with current step
+        current_step = new_model.step
+        # Optax schedule stores hyperparams, we need to call it
+        # For now, extract from optimizer state if possible, else use config
+        try:
+            # Try to get lr from optimizer state
+            # optax.adam stores hyperparams in opt_state[1]
+            lr_value = new_model.opt_state[1].hyperparams['learning_rate']
+            if callable(lr_value):
+                info['lr'] = lr_value(current_step)
+            else:
+                info['lr'] = lr_value
+        except (AttributeError, KeyError, TypeError):
+            # Fallback to config if can't extract
+            info['lr'] = self.config['lr']
 
         # Update the model_eps
         new_model_eps = target_update(self.model, self.model_eps, 1-self.config['target_update_rate'])
@@ -580,7 +638,17 @@ def main(_):
         gram_total = gram_flops_per_block * FLAGS.model.depth * 3.0  # forward+backward+opt
         print(f"Gram branch overhead: {gram_total/1e12:.4f} TFLOPs ({gram_total/F_step*100:.1f}% of total)")
 
-    tx           = optax.adam(learning_rate=FLAGS.model['lr'], b1=FLAGS.model['beta1'], b2=FLAGS.model['beta2'])
+    # Create learning rate schedule with warmup + decay
+    lr_schedule = create_learning_rate_schedule(
+        base_lr=FLAGS.model['lr'],
+        total_steps=FLAGS.max_steps,
+        warmup_steps=FLAGS.model['warmup_steps'],
+        decay_type=FLAGS.model['decay_type'],
+        linear_end=FLAGS.model['linear_end']
+    )
+    print(f"Learning rate schedule: warmup={FLAGS.model['warmup_steps']} steps, decay={FLAGS.model['decay_type']}")
+
+    tx           = optax.adam(learning_rate=lr_schedule, b1=FLAGS.model['beta1'], b2=FLAGS.model['beta2'])
     model_ts     = TrainState.create(model_def, params, tx=tx)
     model_ts_eps = TrainState.create(model_def, params)
     model        = FlowTrainer(rng, model_ts, model_ts_eps, FLAGS.model)
