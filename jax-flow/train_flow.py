@@ -654,11 +654,18 @@ def main(_):
             actual_num_classes = int(truth_fid_stats['num_classes'])
             print(f"Loaded FID stats from {fid_stats_path} (num_classes={actual_num_classes})")
 
-    # Warn if model num_classes doesn't match actual dataset classes
-    if fid_enabled and actual_num_classes != FLAGS.model.num_classes:
-        print(f"WARNING: Model num_classes ({FLAGS.model.num_classes}) != actual dataset classes ({actual_num_classes})")
-        print(f"  Recommend setting --model.num_classes={actual_num_classes}")
-        print(f"  FID will use actual classes from dataset: {actual_num_classes}")
+    # Info: FID evaluation uses classes from validation split
+    if fid_enabled:
+        print(f"FID evaluation info:")
+        print(f"  Model num_classes: {FLAGS.model.num_classes}")
+        print(f"  Val split classes: {actual_num_classes}")
+        if fid_labels_real is not None:
+            label_range = f"[{fid_labels_real.min()}, {fid_labels_real.max()}]"
+            print(f"  Val label range: {label_range}")
+        # Only warn if val labels exceed model capacity
+        if fid_labels_real is not None and fid_labels_real.max() >= FLAGS.model.num_classes:
+            print(f"⚠️  WARNING: Val labels ({fid_labels_real.max()}) exceed model num_classes ({FLAGS.model.num_classes})!")
+            print(f"  Model may not have embeddings for some val classes.")
 
     valid_images_small, _ = next(dataset_valid)
     valid_images_small    = valid_images_small[:device_count, None]
