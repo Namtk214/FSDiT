@@ -350,6 +350,7 @@ class FlowTrainer(flax.struct.PyTreeNode):
     model_eps: TrainState
     config: dict = flax.struct.field(pytree_node=False)
     loss_ema: float = 0.0  # EMA of training loss
+    lr_schedule: Any = flax.struct.field(pytree_node=False, default=None)  # LR schedule function
 
     @partial(jax.pmap, axis_name='data')
     def evaluate(self, images, labels, pmap_axis='data'):
@@ -429,22 +430,12 @@ class FlowTrainer(flax.struct.PyTreeNode):
         )
         info['loss_ema'] = new_loss_ema
 
-        # Log learning rate (compute from schedule using current step)
-        # Learning rate schedule is a function of step in optax
-        # Extract by calling the schedule function with current step
-        current_step = new_model.step
-        # Optax schedule stores hyperparams, we need to call it
-        # For now, extract from optimizer state if possible, else use config
-        try:
-            # Try to get lr from optimizer state
-            # optax.adam stores hyperparams in opt_state[1]
-            lr_value = new_model.opt_state[1].hyperparams['learning_rate']
-            if callable(lr_value):
-                info['lr'] = lr_value(current_step)
-            else:
-                info['lr'] = lr_value
-        except (AttributeError, KeyError, TypeError):
-            # Fallback to config if can't extract
+        # Log current learning rate from schedule
+        if self.lr_schedule is not None:
+            # Call schedule function with current step to get lr
+            info['lr'] = self.lr_schedule(new_model.step)
+        else:
+            # Fallback to constant lr from config
             info['lr'] = self.config['lr']
 
         # Update the model_eps
@@ -651,7 +642,7 @@ def main(_):
     tx           = optax.adam(learning_rate=lr_schedule, b1=FLAGS.model['beta1'], b2=FLAGS.model['beta2'])
     model_ts     = TrainState.create(model_def, params, tx=tx)
     model_ts_eps = TrainState.create(model_def, params)
-    model        = FlowTrainer(rng, model_ts, model_ts_eps, FLAGS.model)
+    model        = FlowTrainer(rng, model_ts, model_ts_eps, FLAGS.model, lr_schedule=lr_schedule)
 
     if FLAGS.load_dir is not None:
         cp    = Checkpoint(FLAGS.load_dir)
