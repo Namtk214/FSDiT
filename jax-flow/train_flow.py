@@ -46,7 +46,7 @@ model_config = ml_collections.ConfigDict({
     'beta1': 0.9,
     'beta2': 0.99,
     # Learning rate schedule
-    'warmup_steps': 500,
+    'warmup_steps': 6000,
     'decay_type': 'cosine',  # 'cosine' or 'linear'
     'linear_end': 0.0,       # End lr for linear decay (ignored if cosine)
     'hidden_size': 768,
@@ -54,17 +54,17 @@ model_config = ml_collections.ConfigDict({
     'depth': 12,
     'num_heads': 12,
     'mlp_ratio': 4,
-    'class_dropout_prob': 0.15,
+    'class_dropout_prob': 0.2,
     'num_classes': 100,
-    'denoise_timesteps': 32,
-    'cfg_scale': 4.0,
+    'denoise_timesteps': 50,
+    'cfg_scale': 3.0,
     'target_update_rate': 0.9999,
     't_sampler': 'log-normal',
     't_conditioning': 1,
     'preset': 'big',
     'use_stable_vae': 1,
     # Gram branch support (new)
-    'use_gram_branch': False,   # Set to True to enable Gram branch
+    'use_gram_branch': True,   # Set to True to enable Gram branch
     'gram_rank': 64,           # Low-rank dimension for Gram branch
     # Logging
     'loss_ema_beta': 0.99,     # EMA smoothing factor for loss
@@ -852,11 +852,31 @@ def main(_):
         valid_info = model.evaluate(valid_images, valid_labels)
         if jax.process_index() == 0:
             valid_info_np = jax.tree.map(lambda x: float(np.array(x).mean()), valid_info)
+            val_loss = valid_info_np['l2_loss']
+
+            # Get current train loss (EMA) from model
+            # model is replicated, so we take the first device's value
+            train_loss_ema = float(np.array(model.loss_ema[0]))
+
+            # Compute generalization gap (val_loss - train_loss)
+            # Positive gap = overfitting, negative = underfitting/easier val set
+            loss_gap = val_loss - train_loss_ema
+            # Relative gap as percentage
+            loss_gap_percent = (loss_gap / max(train_loss_ema, 1e-8)) * 100.0
+
             val_metrics = {
-                'val/loss': valid_info_np['l2_loss'],
+                'val/loss': val_loss,
                 'val/v_abs_mean': valid_info_np['v_abs_mean'],
                 'val/v_pred_abs_mean': valid_info_np['v_pred_abs_mean'],
+                'metrics/train_val_gap': loss_gap,  # Absolute gap (val - train)
+                'metrics/train_val_gap_percent': loss_gap_percent,  # Relative gap (%)
+                'metrics/train_loss_ema_ref': train_loss_ema,  # Reference train loss
             }
+
+            # Print gap info
+            gap_sign = "+" if loss_gap > 0 else ""
+            print(f"[Step {i}] Train loss (EMA): {train_loss_ema:.6f}, Val loss: {val_loss:.6f}, Gap: {gap_sign}{loss_gap:.6f} ({gap_sign}{loss_gap_percent:.2f}%)")
+
             wandb.log(val_metrics, step=i)
 
         # One-step denoising visualization (8 devices only)
