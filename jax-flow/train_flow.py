@@ -54,7 +54,7 @@ model_config = ml_collections.ConfigDict({
     'depth': 12,
     'num_heads': 12,
     'mlp_ratio': 4,
-    'class_dropout_prob': 0.2,
+    'class_dropout_prob': 0.15,
     'num_classes': 100,
     'denoise_timesteps': 50,
     'cfg_scale': 3.0,
