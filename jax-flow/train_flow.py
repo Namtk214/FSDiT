@@ -197,19 +197,20 @@ def estimate_dit_flops_per_step(batch_size, image_size, patch_size, hidden_size,
     # 3. Gram branch (ADDITIVE if enabled)
     if use_gram_branch:
         r = gram_rank
-        # G = X · X_t^T: (B, N, D) @ (B, D, N) → (B, N, N)
-        gram_matrix_flops = 2 * batch_size * N * N * D
+        # Gx = (X @ X^T) / D: (B, N, D) @ (B, D, N) → (B, N, N), then element-wise division
+        gram_matrix_flops = 2 * batch_size * N * N * D  # matmul
+        gram_normalize_flops = batch_size * N * N       # element-wise division by D
 
-        # Rg = G · A · B:
-        # - G @ A: (B, N, N) @ (N, r) → (B, N, r)
-        # - (G@A) @ B: (B, N, r) @ (r, D) → (B, N, D)
+        # Rx = (Gx @ A) @ B:  (proper order for low-rank efficiency)
+        # - Gx @ A: (B, N, N) @ (N, r) → (B, N, r)
+        # - (Gx@A) @ B: (B, N, r) @ (r, D) → (B, N, D)
         gram_proj_flops = 2 * batch_size * N * N * r + 2 * batch_size * N * r * D
 
-        # RMSNorm: ~B*N*D (negligible compared to matmul)
-        gram_norm_flops = batch_size * N * D
+        # RMSNorm: ~2*B*N*D (mean + scale operations)
+        gram_norm_flops = 2 * batch_size * N * D
 
         # Total Gram FLOPs per block
-        gram_flops_per_block = gram_matrix_flops + gram_proj_flops + gram_norm_flops
+        gram_flops_per_block = gram_matrix_flops + gram_normalize_flops + gram_proj_flops + gram_norm_flops
         per_block_flops += gram_flops_per_block
 
     # Total for all blocks
@@ -621,13 +622,22 @@ def main(_):
     print(f"Estimated TFLOPs per step: {F_step / 1e12:.4f}")
 
     if FLAGS.model.use_gram_branch:
-        # Estimate Gram overhead
+        # Estimate Gram overhead (updated for correct implementation)
         N = (FLAGS.model.image_size // FLAGS.model.patch_size) ** 2
         D = FLAGS.model.hidden_size
         r = FLAGS.model.gram_rank
-        gram_flops_per_block = FLAGS.batch_size * N * (2*N*D + 2*N*r + 2*r*D + D)
+        B = FLAGS.batch_size
+        # Gram: (X@X^T)/D + (G@A)@B + RMSNorm
+        gram_matmul = 2 * B * N * N * D       # X @ X^T
+        gram_norm_div = B * N * N             # element-wise /D
+        gram_lowrank = 2 * B * N * N * r + 2 * B * N * r * D  # (G@A)@B
+        gram_rmsnorm = 2 * B * N * D          # RMSNorm
+        gram_flops_per_block = gram_matmul + gram_norm_div + gram_lowrank + gram_rmsnorm
         gram_total = gram_flops_per_block * FLAGS.model.depth * 3.0  # forward+backward+opt
         print(f"Gram branch overhead: {gram_total/1e12:.4f} TFLOPs ({gram_total/F_step*100:.1f}% of total)")
+        print(f"  - Gram matrix (X@X^T)/D: {(gram_matmul + gram_norm_div) * FLAGS.model.depth * 3.0 / 1e12:.4f} TFLOPs")
+        print(f"  - Low-rank proj (G@A)@B: {gram_lowrank * FLAGS.model.depth * 3.0 / 1e12:.4f} TFLOPs")
+        print(f"  - RMSNorm: {gram_rmsnorm * FLAGS.model.depth * 3.0 / 1e12:.4f} TFLOPs")
 
     # Create learning rate schedule with warmup + decay
     lr_schedule = create_learning_rate_schedule(

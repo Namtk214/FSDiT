@@ -240,12 +240,21 @@ class DiTBlock(nn.Module):
     """
     A DiT block with adaptive layer norm zero (adaLN-Zero) conditioning.
 
-    Modified to support Gram branch:
-    - Keeps standard self-attention residual (always computed)
+    Modified to support Gram branch (as per spec):
+    - Keeps standard self-attention residual (always computed, gated by α1)
     - Optionally ADDS a Gram-based residual branch (low-rank token-token interaction)
-    - Uses SAME gate (α1) for both attention and Gram (maintains 6 gates like original DiT)
-    - Output: X1 = X + α1⊙(MSA(X̃) + RMSNorm(G·A·B))  [if use_gram_branch=True]
-            or X1 = X + α1⊙MSA(X̃)                    [if use_gram_branch=False]
+    - Gram residual is UNGATED (added directly, not multiplied by α1)
+    - Maintains 6 gates like original DiT (γ1, β1, α1, γ2, β2, α2)
+
+    Output formulas:
+    - if use_gram_branch=False:  X1 = X + α1⊙MSA(X̃)
+    - if use_gram_branch=True:   X1 = X + α1⊙MSA(X̃) + RMSNorm((XX^T/D)·A·B)
+
+    Gram design:
+    - Uses raw token X (not modulated X̃) for Gram matrix
+    - Normalized by D to stabilize magnitude
+    - Low-rank projection with LoRA-style init (A~N(0,0.01), B=0)
+    - No gate on Gram residual (allows independent contribution)
 
     Can be toggled on/off via use_gram_branch parameter.
     """
@@ -293,33 +302,34 @@ class DiTBlock(nn.Module):
 
         # Gram branch (ADDITIONAL residual if enabled)
         if self.use_gram_branch:
-            # X_t = X̃ (modulated input, recommended for stability)
-            x_t = x_modulated
-
-            # G = X · X_t^T  (token-token Gram matrix)
-            # Note: Use x (not x_modulated) for diversity, x_t for stability
-            gram = jnp.matmul(x, jnp.swapaxes(x_t, -1, -2))  # (B, N, N)
-
-            # Low-rank projection: Rg = G · A · B
+            # Gx = (X @ X^T) / D  (token-token Gram matrix from RAW tokens)
+            # Normalize by D to keep magnitude stable
             num_tokens = x.shape[1]
-            A = self.param('gram_A', nn.initializers.normal(0.02), (num_tokens, self.gram_rank))
-            B = self.param('gram_B', nn.initializers.normal(0.02), (self.gram_rank, self.hidden_size))
+            D = self.hidden_size
+            gram = jnp.matmul(x, jnp.swapaxes(x, -1, -2)) / D  # (B, N, N)
 
-            rg = jnp.matmul(gram, jnp.matmul(A, B))  # (B, N, N) @ (N, D) → (B, N, D)
+            # Low-rank projection: Rx = (Gx @ A) @ B
+            # IMPORTANT: Use proper order (G@A)@B to leverage low-rank efficiency
+            A = self.param('gram_A', nn.initializers.normal(0.01), (num_tokens, self.gram_rank))
+            B = self.param('gram_B', nn.initializers.zeros, (self.gram_rank, self.hidden_size))
+
+            # Optimized matmul order: (G @ A) @ B instead of G @ (A @ B)
+            rx = jnp.matmul(jnp.matmul(gram, A), B)  # (B, N, N)@(N, r) → (B, N, r) → (B, N, D)
 
             # RMSNorm for stability
-            rg_hat = RMSNorm()(rg)
+            rx_hat = RMSNorm()(rx)
 
-            # Gram residual with shared gate (use gate_msa, same as attention)
-            gram_residual = gate_msa[:, None] * rg_hat
+            # Gram residual is added DIRECTLY (NO gate, as per spec)
+            # This allows Gram to contribute independently from attention gating
+            gram_residual = rx_hat
 
             # DEBUG
             if self.debug:
-                jax.debug.print("🔵 Gram: G={g_shape}, A={a_shape}, B={b_shape}, gate_msa_mean={gm}",
+                jax.debug.print("🔵 Gram: G={g_shape}, A={a_shape}, B={b_shape}, rx_norm={rn}",
                                g_shape=gram.shape, a_shape=A.shape, b_shape=B.shape,
-                               gm=jnp.mean(jnp.abs(gate_msa)))
+                               rn=jnp.mean(jnp.abs(rx_hat)))
 
-            # Combined residual: attention + Gram
+            # Combined residual: attention (gated) + Gram (ungated)
             x = x + attn_residual + gram_residual
         else:
             # Standard: only attention residual
@@ -358,12 +368,19 @@ class DiT(nn.Module):
     Diffusion model with a Transformer backbone.
     Supports both class-label conditioning (original) and support-set conditioning (FSDiT).
 
-    Modified to support Gram branch:
-    - Keeps standard self-attention in all blocks
-    - Optionally ADDS Gram-based low-rank residual (token-token interaction)
+    Modified to support Gram branch (as per spec):
+    - Keeps standard self-attention in all blocks (gated by α1)
+    - Optionally ADDS Gram-based low-rank residual (token-token interaction, UNGATED)
     - Uses SAME gates/shifts as original DiT (6 per block: γ1, β1, α1, γ2, β2, α2)
-    - Per block: X1 = X + α1⊙(MSA(X̃) + Gram(X))  [if enabled]
-                 X1 = X + α1⊙MSA(X̃)              [if disabled]
+    - Per block:
+        if disabled: X1 = X + α1⊙MSA(X̃)
+        if enabled:  X1 = X + α1⊙MSA(X̃) + RMSNorm((XX^T/D)·A·B)
+
+    Gram branch design:
+    - Gram matrix from raw tokens: Gx = (X @ X^T) / D
+    - Low-rank projection: Rx = (Gx @ A) @ B  (proper order for efficiency)
+    - LoRA-style init: A~N(0,0.01), B=0 (zero-init for stability)
+    - No gate: Gram residual added directly (independent from attention gating)
     """
     patch_size: int
     hidden_size: int
@@ -392,9 +409,12 @@ class DiT(nn.Module):
             print(f"MLP ratio: {self.mlp_ratio}")
             print(f"Gates/block: 6 (γ1, β1, α1, γ2, β2, α2) - SAME as original DiT")
             if self.use_gram_branch:
-                print(f"✅ GRAM BRANCH ENABLED (ADDITIVE): rank={self.gram_rank}")
-                print(f"   Output: X1 = X + α1⊙(MSA(X̃) + Gram(X))")
-                print(f"   Gram shares gate α1 with attention (zero-init)")
+                print(f"✅ GRAM BRANCH ENABLED (ADDITIVE, UNGATED): rank={self.gram_rank}")
+                print(f"   Output: X1 = X + α1⊙MSA(X̃) + RMSNorm((XX^T/D)·A·B)")
+                print(f"   - Gram from raw X, normalized by D")
+                print(f"   - Low-rank: (G@A)@B order for efficiency")
+                print(f"   - Init: A~N(0,0.01), B=0 (LoRA-style zero-init)")
+                print(f"   - NO gate on Gram (independent contribution)")
             else:
                 print(f"❌ GRAM BRANCH DISABLED (standard DiT)")
                 print(f"   Output: X1 = X + α1⊙MSA(X̃)")
