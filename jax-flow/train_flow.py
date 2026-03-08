@@ -64,7 +64,7 @@ model_config = ml_collections.ConfigDict({
     'preset': 'big',
     'use_stable_vae': 1,
     # Gram branch support (new)
-    'use_gram_branch': False,   # Set to True to enable Gram branch
+    'use_gram_branch': True,   # Set to True to enable Gram branch
     'gram_rank': 64,           # Low-rank dimension for Gram branch
     # Logging
     'loss_ema_beta': 0.99,     # EMA smoothing factor for loss
@@ -229,7 +229,26 @@ def estimate_dit_flops_per_step(batch_size, image_size, patch_size, hidden_size,
     # Use conservative estimate: F_step = 3 * F_fwd
     F_step = 3.0 * F_fwd
 
-    return F_step
+    # Return breakdown for detailed logging
+    breakdown = {
+        'total': F_step,
+        'forward': F_fwd,
+        'patch_embed': patch_embed_flops * 3.0,
+        'timestep': timestep_flops * 3.0,
+        'label': label_flops * 3.0,
+        'transformer': transformer_flops * 3.0,
+        'final': final_flops * 3.0,
+        'per_block': per_block_flops * 3.0,
+    }
+
+    # Add Gram-specific breakdown if enabled
+    if use_gram_branch:
+        breakdown['gram_matrix'] = gram_matrix_flops * depth * 3.0
+        breakdown['gram_proj'] = gram_proj_flops * depth * 3.0
+        breakdown['gram_norm'] = gram_norm_flops * depth * 3.0
+        breakdown['gram_total'] = gram_flops_per_block * depth * 3.0
+
+    return F_step, breakdown
 
 def get_x_t(images, eps, t):
     t = jnp.clip(t, 0, 1 - 0.01)
@@ -606,7 +625,7 @@ def main(_):
     print("="*80 + "\n")
 
     # Estimate FLOPs per training step
-    F_step = estimate_dit_flops_per_step(
+    F_step, flops_breakdown = estimate_dit_flops_per_step(
         batch_size=FLAGS.batch_size,
         image_size=FLAGS.model.image_size,
         patch_size=FLAGS.model.patch_size,
@@ -618,8 +637,21 @@ def main(_):
         use_gram_branch=FLAGS.model.use_gram_branch,
         gram_rank=FLAGS.model.gram_rank
     )
-    print(f"Estimated FLOPs per step: {F_step:.2e}")
-    print(f"Estimated TFLOPs per step: {F_step / 1e12:.4f}")
+    print(f"\n💡 OPERATIONS COUNT (not throughput):")
+    print(f"  - Total FLOPs per step: {F_step:.2e} ({F_step / 1e12:.2f} TFLOPs)")
+    print(f"  - This is the NUMBER of operations, NOT speed!")
+    print(f"  - Runtime throughput will be logged as 'perf/throughput_tflops_per_sec'")
+
+    # Print breakdown
+    print(f"\n📊 OPERATIONS BREAKDOWN (per training step):")
+    print(f"  - Patch embed:  {flops_breakdown['patch_embed']/1e12:.2f} TFLOPs ({flops_breakdown['patch_embed']/F_step*100:.1f}%)")
+    print(f"  - Timestep emb: {flops_breakdown['timestep']/1e12:.2f} TFLOPs ({flops_breakdown['timestep']/F_step*100:.1f}%)")
+    print(f"  - Label emb:    {flops_breakdown['label']/1e12:.2f} TFLOPs ({flops_breakdown['label']/F_step*100:.1f}%)")
+    print(f"  - Transformer:  {flops_breakdown['transformer']/1e12:.2f} TFLOPs ({flops_breakdown['transformer']/F_step*100:.1f}%)")
+    print(f"    - Per block:  {flops_breakdown['per_block']/1e12:.2f} TFLOPs")
+    if FLAGS.model.use_gram_branch and 'gram_total' in flops_breakdown:
+        print(f"    - Gram branch: {flops_breakdown['gram_total']/1e12:.2f} TFLOPs ({flops_breakdown['gram_total']/F_step*100:.1f}% of total)")
+    print(f"  - Final layer:  {flops_breakdown['final']/1e12:.2f} TFLOPs ({flops_breakdown['final']/F_step*100:.1f}%)")
 
     if FLAGS.model.use_gram_branch:
         # Estimate Gram overhead (updated for correct implementation)
@@ -689,7 +721,8 @@ def main(_):
         wandb.log({
             'model/num_params': total_params,
             'model/trainable_params': total_params,
-            'model/estimated_tflops_per_step': F_step / 1e12,
+            # Static FLOPs count (total operations per step, NOT throughput)
+            'model/flops_per_step': F_step,  # Raw number (not divided)
         }, step=0)
 
     model = flax.jax_utils.replicate(model, devices=jax.local_devices())
@@ -944,8 +977,8 @@ def main(_):
             update_info = jax.tree.map(lambda x: np.array(x), update_info)
             update_info = jax.tree.map(lambda x: x.mean(), update_info)
 
-            # Calculate TFLOPS
-            tflops = F_step / (step_time * 1e12)
+            # Calculate throughput (TFLOPs per second)
+            throughput_tflops_per_sec = F_step / (step_time * 1e12)
 
             # Build comprehensive training metrics
             train_metrics = {
@@ -956,8 +989,10 @@ def main(_):
                 'train/param_norm': update_info['param_norm'],
                 'train/v_abs_mean': update_info['v_abs_mean'],
                 'train/v_pred_abs_mean': update_info['v_pred_abs_mean'],
-                'perf/train_step_time': step_time,
-                'perf/tflops': tflops,
+                # Performance metrics (clearer naming)
+                'perf/step_time_seconds': step_time,
+                'perf/throughput_tflops_per_sec': throughput_tflops_per_sec,
+                'perf/flops_per_step': F_step,  # Total operations (for reference)
             }
 
             if jax.process_index() == 0:

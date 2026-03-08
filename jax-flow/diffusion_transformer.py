@@ -253,7 +253,7 @@ class DiTBlock(nn.Module):
     Gram design:
     - Uses raw token X (not modulated X̃) for Gram matrix
     - Normalized by D to stabilize magnitude
-    - Low-rank projection with LoRA-style init (A~N(0,0.01), B=0)
+    - Low-rank projection with improved init (A: Kaiming He, B: zeros)
     - No gate on Gram residual (allows independent contribution)
 
     Can be toggled on/off via use_gram_branch parameter.
@@ -310,7 +310,9 @@ class DiTBlock(nn.Module):
 
             # Low-rank projection: Rx = (Gx @ A) @ B
             # IMPORTANT: Use proper order (G@A)@B to leverage low-rank efficiency
-            A = self.param('gram_A', nn.initializers.normal(0.01), (num_tokens, self.gram_rank))
+            # A: Kaiming He init (better for deep networks)
+            # B: zeros (LoRA-style zero-init for stability)
+            A = self.param('gram_A', nn.initializers.kaiming_normal(), (num_tokens, self.gram_rank))
             B = self.param('gram_B', nn.initializers.zeros, (self.gram_rank, self.hidden_size))
 
             # Optimized matmul order: (G @ A) @ B instead of G @ (A @ B)
@@ -379,7 +381,7 @@ class DiT(nn.Module):
     Gram branch design:
     - Gram matrix from raw tokens: Gx = (X @ X^T) / D
     - Low-rank projection: Rx = (Gx @ A) @ B  (proper order for efficiency)
-    - LoRA-style init: A~N(0,0.01), B=0 (zero-init for stability)
+    - Improved init: A: Kaiming He, B: zeros (zero-init for stability)
     - No gate: Gram residual added directly (independent from attention gating)
     """
     patch_size: int
@@ -413,7 +415,7 @@ class DiT(nn.Module):
                 print(f"   Output: X1 = X + α1⊙MSA(X̃) + RMSNorm((XX^T/D)·A·B)")
                 print(f"   - Gram from raw X, normalized by D")
                 print(f"   - Low-rank: (G@A)@B order for efficiency")
-                print(f"   - Init: A~N(0,0.01), B=0 (LoRA-style zero-init)")
+                print(f"   - Init: A: Kaiming He, B: zeros (zero-init)")
                 print(f"   - NO gate on Gram (independent contribution)")
             else:
                 print(f"❌ GRAM BRANCH DISABLED (standard DiT)")
