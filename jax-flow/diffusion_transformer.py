@@ -240,21 +240,29 @@ class DiTBlock(nn.Module):
     """
     A DiT block with adaptive layer norm zero (adaLN-Zero) conditioning.
 
-    Modified to support Gram branch (as per spec):
-    - Keeps standard self-attention residual (always computed, gated by α1)
-    - Optionally ADDS a Gram-based residual branch (low-rank token-token interaction)
-    - Gram residual is UNGATED (added directly, not multiplied by α1)
+    Two modes:
+    1. Base DiT (use_gram_branch=False): Standard attention, no modifications
+    2. Gram-DiT (use_gram_branch=True): Per-head alpha gates + Gram branch
+
+    Base DiT mode (use_gram_branch=False):
+    - Standard multi-head attention (no per-head gates)
+    - Output: X1 = X + α1⊙MSA(X̃)
+
+    Gram-DiT mode (use_gram_branch=True):
+    - Per-head learnable alpha gates for attention
+      - Each head h has learnable scalar α_h
+      - Init: α_h ~ N(0.1, 0.05) (low values to favor Gram branch initially)
+      - Output: MSA(X̃) = Σ_h α_h · Head_h
+    - Gram-based additive residual branch
+      - Gram matrix from raw tokens: Gx = (X @ X^T) / D
+      - Low-rank projection: Rx = (Gx @ A) @ B
+      - Init: A ~ Kaiming He, B = zeros (zero-init)
+      - Ungated (added directly, independent from α1)
+    - Output: X1 = X + α1⊙MSA_alpha(X̃) + RMSNorm(Rx)
+
+    Architecture:
     - Maintains 6 gates like original DiT (γ1, β1, α1, γ2, β2, α2)
-
-    Output formulas:
-    - if use_gram_branch=False:  X1 = X + α1⊙MSA(X̃)
-    - if use_gram_branch=True:   X1 = X + α1⊙MSA(X̃) + RMSNorm((XX^T/D)·A·B)
-
-    Gram design:
-    - Uses raw token X (not modulated X̃) for Gram matrix
-    - Normalized by D to stabilize magnitude
-    - Low-rank projection with improved init (A: Kaiming He, B: zeros)
-    - No gate on Gram residual (allows independent contribution)
+    - α1 gates attention output, Gram branch is ungated
 
     Can be toggled on/off via use_gram_branch parameter.
     """
@@ -272,13 +280,18 @@ class DiTBlock(nn.Module):
         c = nn.Dense(6 * self.hidden_size, kernel_init=nn.initializers.constant(0.))(c)
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = jnp.split(c, 6, axis=-1)
 
-        # Attention path (ALWAYS computed, even with Gram branch)
+        # Attention path
         x_norm = nn.LayerNorm(use_bias=False, use_scale=False)(x)
         x_modulated = modulate(x_norm, shift_msa, scale_msa)  # X̃
 
-        # Compute attention residual
-        if return_attn:
-            # Custom attention to get weights
+        # Attention implementation depends on whether Gram branch is enabled
+        if self.use_gram_branch:
+            # Custom attention with per-head learnable alpha gates
+            # Alpha gates favor Gram branch initially with low init values
+            alpha_heads = self.param('alpha_heads',
+                                     lambda rng, shape: jax.random.normal(rng, shape) * 0.05 + 0.1,
+                                     (self.num_heads,))
+
             head_dim = self.hidden_size // self.num_heads
             qkv = nn.Dense(3 * self.hidden_size, kernel_init=nn.initializers.xavier_uniform())(x_modulated)
             q, k, v = jnp.split(qkv, 3, axis=-1)
@@ -289,13 +302,43 @@ class DiTBlock(nn.Module):
             scale = head_dim ** -0.5
             attn_logits = jnp.einsum('bhqd,bhkd->bhqk', q, k) * scale
             attn_weights = jax.nn.softmax(attn_logits, axis=-1)  # (B, H, Q, K)
-            attn_x = jnp.einsum('bhqk,bhkd->bhqd', attn_weights, v)
+            attn_x = jnp.einsum('bhqk,bhkd->bhqd', attn_weights, v)  # (B, H, N, d)
+
+            # Apply per-head alpha gates BEFORE concat
+            attn_x = attn_x * alpha_heads[None, :, None, None]
+
+            # Concat heads and project
             attn_x = rearrange(attn_x, 'b h n d -> b n (h d)')
             attn_x = nn.Dense(self.hidden_size, kernel_init=nn.initializers.xavier_uniform())(attn_x)
+
+            # Store for logging
+            if return_attn:
+                attn_info = (attn_weights, alpha_heads)
         else:
-            attn_x = nn.MultiHeadDotProductAttention(kernel_init=nn.initializers.xavier_uniform(),
-                num_heads=self.num_heads)(x_modulated, x_modulated)
-            attn_weights = None
+            # Standard attention (no per-head gates) for Base DiT
+            if return_attn:
+                # Custom implementation to get attention weights
+                head_dim = self.hidden_size // self.num_heads
+                qkv = nn.Dense(3 * self.hidden_size, kernel_init=nn.initializers.xavier_uniform())(x_modulated)
+                q, k, v = jnp.split(qkv, 3, axis=-1)
+                q = rearrange(q, 'b n (h d) -> b h n d', h=self.num_heads)
+                k = rearrange(k, 'b n (h d) -> b h n d', h=self.num_heads)
+                v = rearrange(v, 'b n (h d) -> b h n d', h=self.num_heads)
+
+                scale = head_dim ** -0.5
+                attn_logits = jnp.einsum('bhqd,bhkd->bhqk', q, k) * scale
+                attn_weights = jax.nn.softmax(attn_logits, axis=-1)
+                attn_x = jnp.einsum('bhqk,bhkd->bhqd', attn_weights, v)
+                attn_x = rearrange(attn_x, 'b h n d -> b n (h d)')
+                attn_x = nn.Dense(self.hidden_size, kernel_init=nn.initializers.xavier_uniform())(attn_x)
+
+                attn_info = (attn_weights, None)  # No alpha for base DiT
+            else:
+                # Use standard Flax implementation (most efficient)
+                attn_x = nn.MultiHeadDotProductAttention(
+                    kernel_init=nn.initializers.xavier_uniform(),
+                    num_heads=self.num_heads
+                )(x_modulated, x_modulated)
 
         # Apply attention residual with gate
         attn_residual = gate_msa[:, None] * attn_x
@@ -344,7 +387,7 @@ class DiTBlock(nn.Module):
         x = x + (gate_mlp[:, None] * mlp_x)
 
         if return_attn:
-            return x, attn_weights
+            return x, attn_info  # Return (output, (attn_weights, alpha_heads))
         return x
     
 class FinalLayer(nn.Module):
@@ -411,14 +454,20 @@ class DiT(nn.Module):
             print(f"MLP ratio: {self.mlp_ratio}")
             print(f"Gates/block: 6 (γ1, β1, α1, γ2, β2, α2) - SAME as original DiT")
             if self.use_gram_branch:
-                print(f"✅ GRAM BRANCH ENABLED (ADDITIVE, UNGATED): rank={self.gram_rank}")
-                print(f"   Output: X1 = X + α1⊙MSA(X̃) + RMSNorm((XX^T/D)·A·B)")
+                print(f"✅ GRAM-DiT MODE (attention + Gram branch)")
+                print(f"   Per-head alpha gates: {self.num_heads} learnable scalars")
+                print(f"   - Init: α_h ~ N(0.1, 0.05) per head (favors Gram initially)")
+                print(f"   - Attention: MSA(X̃) = Σ_h α_h · Head_h")
+                print(f"   Gram branch (ADDITIVE, UNGATED): rank={self.gram_rank}")
                 print(f"   - Gram from raw X, normalized by D")
                 print(f"   - Low-rank: (G@A)@B order for efficiency")
                 print(f"   - Init: A: Kaiming He, B: zeros (zero-init)")
                 print(f"   - NO gate on Gram (independent contribution)")
+                print(f"   Output: X1 = X + α1⊙MSA_alpha(X̃) + RMSNorm((XX^T/D)·A·B)")
             else:
-                print(f"❌ GRAM BRANCH DISABLED (standard DiT)")
+                print(f"❌ BASE DiT MODE (standard attention only)")
+                print(f"   - No per-head alpha gates")
+                print(f"   - No Gram branch")
                 print(f"   Output: X1 = X + α1⊙MSA(X̃)")
             print("="*80 + "\n")
 

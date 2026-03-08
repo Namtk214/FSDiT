@@ -64,7 +64,7 @@ model_config = ml_collections.ConfigDict({
     'preset': 'big',
     'use_stable_vae': 1,
     # Gram branch support (new)
-    'use_gram_branch': False,   # Set to True to enable Gram branch
+    'use_gram_branch': True,   # Set to True to enable Gram branch
     'gram_rank': 64,           # Low-rank dimension for Gram branch
     # Logging
     'loss_ema_beta': 0.99,     # EMA smoothing factor for loss
@@ -440,6 +440,35 @@ class FlowTrainer(flax.struct.PyTreeNode):
         info['update_norm'] = optax.global_norm(updates)
         info['param_norm'] = optax.global_norm(new_params)
 
+        # Extract Gram branch gradients and alpha values for logging
+        if self.config.get('use_gram_branch', False):
+            # Collect gradients and values from all blocks
+            gram_A_grads = []
+            gram_B_grads = []
+            alpha_values = []
+
+            for i in range(self.config['depth']):
+                block_key = f'DiTBlock_{i}'
+                if block_key in grads:
+                    # Gradients
+                    if 'gram_A' in grads[block_key]:
+                        gram_A_grads.append(grads[block_key]['gram_A'])
+                    if 'gram_B' in grads[block_key]:
+                        gram_B_grads.append(grads[block_key]['gram_B'])
+                    # Alpha values (from params, not grads)
+                    if 'alpha_heads' in new_params[block_key]:
+                        alpha_values.append(new_params[block_key]['alpha_heads'])
+
+            # Compute gradient norms
+            if gram_A_grads:
+                info['gram_A_grad_norm'] = optax.global_norm(gram_A_grads)
+            if gram_B_grads:
+                info['gram_B_grad_norm'] = optax.global_norm(gram_B_grads)
+
+            # Store first block's alpha values (representative)
+            if alpha_values:
+                info['alpha_heads'] = alpha_values[0]  # Shape: (num_heads,)
+
         # Update EMA loss
         beta = self.config.get('loss_ema_beta', 0.99)
         # Use jnp.where instead of if to avoid tracer error in pmap
@@ -716,13 +745,14 @@ def main(_):
             fid_mu_real = None
             fid_sigma_real = None
 
-    # Log model info to wandb
+    # Log model info to wandb (ONE TIME at step=0)
     if jax.process_index() == 0:
         wandb.log({
             'model/num_params': total_params,
             'model/trainable_params': total_params,
-            # Static FLOPs count (total operations per step, NOT throughput)
-            'model/flops_per_step': F_step,  # Raw number (not divided)
+            # Static operations count (CONSTANT - logged once)
+            'model/flops_per_step': F_step,  # Total floating point operations per step
+            'model/tflops_per_step': F_step / 1e12,  # Same as above, in TFLOPs (tera operations)
         }, step=0)
 
     model = flax.jax_utils.replicate(model, devices=jax.local_devices())
@@ -959,6 +989,9 @@ def main(_):
         del valid_images, valid_labels
         print("Finished eval")
 
+    # Cumulative TFLOPs tracking (total operations executed from start)
+    cumulative_tflops = 0.0
+
     for i in tqdm.tqdm(range(1, FLAGS.max_steps + 1), smoothing=0.1, dynamic_ncols=True):
         step_start_time = time.time()
 
@@ -972,6 +1005,9 @@ def main(_):
         model, update_info = model.update(batch_images, batch_labels)
 
         step_time = time.time() - step_start_time
+
+        # Accumulate TFLOPs
+        cumulative_tflops += F_step / 1e12
 
         if i % FLAGS.log_interval == 0:
             update_info = jax.tree.map(lambda x: np.array(x), update_info)
@@ -989,11 +1025,30 @@ def main(_):
                 'train/param_norm': update_info['param_norm'],
                 'train/v_abs_mean': update_info['v_abs_mean'],
                 'train/v_pred_abs_mean': update_info['v_pred_abs_mean'],
-                # Performance metrics (clearer naming)
+                # Performance metrics
                 'perf/step_time_seconds': step_time,
                 'perf/throughput_tflops_per_sec': throughput_tflops_per_sec,
-                'perf/flops_per_step': F_step,  # Total operations (for reference)
+                'perf/cumulative_tflops': cumulative_tflops,  # Total TFLOPs executed so far
+                # NOTE: flops_per_step is a constant, logged once at step=0 as 'model/flops_per_step'
             }
+
+            # Add Gram branch specific metrics if enabled
+            if FLAGS.model.use_gram_branch:
+                if 'gram_A_grad_norm' in update_info:
+                    train_metrics['gram/A_grad_norm'] = float(update_info['gram_A_grad_norm'])
+                if 'gram_B_grad_norm' in update_info:
+                    train_metrics['gram/B_grad_norm'] = float(update_info['gram_B_grad_norm'])
+
+                # Log per-head alpha values
+                if 'alpha_heads' in update_info:
+                    alpha_heads = update_info['alpha_heads']
+                    for head_idx in range(len(alpha_heads)):
+                        train_metrics[f'alpha/head_{head_idx}'] = float(alpha_heads[head_idx])
+                    # Also log mean/std/min/max for summary
+                    train_metrics['alpha/mean'] = float(jnp.mean(alpha_heads))
+                    train_metrics['alpha/std'] = float(jnp.std(alpha_heads))
+                    train_metrics['alpha/min'] = float(jnp.min(alpha_heads))
+                    train_metrics['alpha/max'] = float(jnp.max(alpha_heads))
 
             if jax.process_index() == 0:
                 wandb.log(train_metrics, step=i)
