@@ -1011,6 +1011,12 @@ def main(_):
 
         if i % FLAGS.log_interval == 0:
             update_info = jax.tree.map(lambda x: np.array(x), update_info)
+
+            # Extract alpha_heads BEFORE .mean() to preserve per-head dimension
+            alpha_heads_raw = None
+            if FLAGS.model.use_gram_branch and 'alpha_heads' in update_info:
+                alpha_heads_raw = update_info['alpha_heads']  # Shape: (devices, num_heads)
+
             update_info = jax.tree.map(lambda x: x.mean(), update_info)
 
             # Calculate throughput (TFLOPs per second)
@@ -1039,9 +1045,10 @@ def main(_):
                 if 'gram_B_grad_norm' in update_info:
                     train_metrics['gram/B_grad_norm'] = float(update_info['gram_B_grad_norm'])
 
-                # Log per-head alpha values
-                if 'alpha_heads' in update_info:
-                    alpha_heads = update_info['alpha_heads']
+                # Log per-head alpha values (use preserved raw version)
+                if alpha_heads_raw is not None:
+                    # Average across devices but keep per-head dimension: (devices, heads) -> (heads,)
+                    alpha_heads = np.array(alpha_heads_raw).mean(axis=0)
                     for head_idx in range(len(alpha_heads)):
                         train_metrics[f'alpha/head_{head_idx}'] = float(alpha_heads[head_idx])
                     # Also log mean/std/min/max for summary
