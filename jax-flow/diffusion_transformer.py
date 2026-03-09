@@ -337,8 +337,8 @@ class DiTBlock(nn.Module):
             # Learnable beta scalar with softplus to ensure positivity
             # Init: b = 1.855 so that softplus(b) ≈ 2.0
             b_raw = self.param('gram_beta_raw',
-                              lambda _: jnp.array(1.855),
-                              None)
+                              lambda rng, shape: jnp.array(1.855),
+                              ())
             beta = jax.nn.softplus(b_raw)
 
             # Scale Gram residual by beta
