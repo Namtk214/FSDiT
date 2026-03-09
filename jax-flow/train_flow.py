@@ -608,10 +608,14 @@ def main(_):
     print(f"\n📊 PARAMETER BREAKDOWN:")
 
     # Count attention params (should ALWAYS exist)
+    # When use_gram_branch=True: attention params are in Dense_0 (QKV), Dense_1 (output), alpha_heads
+    # When use_gram_branch=False: attention params are in MultiHeadDotProductAttention_0
     attn_params = 0
+    alpha_params = 0
     for i in range(FLAGS.model.depth):
         block_key = f'DiTBlock_{i}'
         if block_key in params:
+            # Case 1: Standard DiT with MultiHeadDotProductAttention
             if 'MultiHeadDotProductAttention_0' in params[block_key]:
                 attn_block = params[block_key]['MultiHeadDotProductAttention_0']
                 for k, v in attn_block.items():
@@ -622,8 +626,25 @@ def main(_):
                     elif hasattr(v, 'size'):
                         attn_params += v.size
 
+            # Case 2: Gram-DiT with custom attention (Dense layers)
+            # Dense_0 = QKV projection, Dense_1 = output projection
+            if 'Dense_0' in params[block_key] and 'kernel' in params[block_key]['Dense_0']:
+                attn_params += params[block_key]['Dense_0']['kernel'].size
+                if 'bias' in params[block_key]['Dense_0']:
+                    attn_params += params[block_key]['Dense_0']['bias'].size
+            if 'Dense_1' in params[block_key] and 'kernel' in params[block_key]['Dense_1']:
+                attn_params += params[block_key]['Dense_1']['kernel'].size
+                if 'bias' in params[block_key]['Dense_1']:
+                    attn_params += params[block_key]['Dense_1']['bias'].size
+
+            # Count alpha_heads separately (only in Gram-DiT)
+            if 'alpha_heads' in params[block_key]:
+                alpha_params += params[block_key]['alpha_heads'].size
+
     if attn_params > 0:
         print(f"✓ Attention params: {attn_params:,} ({attn_params/total_params*100:.2f}% of model)")
+        if alpha_params > 0:
+            print(f"  - Per-head alpha gates: {alpha_params:,} params ({FLAGS.model.num_heads} heads × {FLAGS.model.depth} blocks)")
     else:
         print(f"⚠️  WARNING: No attention params found!")
 

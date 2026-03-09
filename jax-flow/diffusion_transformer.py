@@ -241,28 +241,28 @@ class DiTBlock(nn.Module):
     A DiT block with adaptive layer norm zero (adaLN-Zero) conditioning.
 
     Two modes:
-    1. Base DiT (use_gram_branch=False): Standard attention, no modifications
-    2. Gram-DiT (use_gram_branch=True): Per-head alpha gates + Gram branch
+    1. Base DiT (use_gram_branch=False): Standard attention with identity residual
+    2. Gram-DiT (use_gram_branch=True): Gram residual replaces identity
 
     Base DiT mode (use_gram_branch=False):
-    - Standard multi-head attention (no per-head gates)
+    - Standard multi-head attention
     - Output: X1 = X + α1⊙MSA(X̃)
 
     Gram-DiT mode (use_gram_branch=True):
-    - Per-head learnable alpha gates for attention
-      - Each head h has learnable scalar α_h
-      - Init: α_h ~ N(0.1, 0.05) (low values to favor Gram branch initially)
-      - Output: MSA(X̃) = Σ_h α_h · Head_h
-    - Gram-based additive residual branch
+    - Standard multi-head attention (same as base)
+    - Gram-based residual branch REPLACES identity residual
       - Gram matrix from raw tokens: Gx = (X @ X^T) / D
       - Low-rank projection: Rx = (Gx @ A) @ B
-      - Init: A ~ Kaiming He, B = zeros (zero-init)
-      - Ungated (added directly, independent from α1)
-    - Output: X1 = X + α1⊙MSA_alpha(X̃) + RMSNorm(Rx)
+      - Init: A, B ~ Uniform(mean=0.1, std=0.05)
+      - Scaled by learnable β = softplus(b), init b=1.855 → β₀=2.0
+    - Output: X1 = α1⊙MSA(X̃) + β·RMSNorm(Rx)
+
+    Key difference: NO identity residual `+ X` in Gram-DiT mode
 
     Architecture:
     - Maintains 6 gates like original DiT (γ1, β1, α1, γ2, β2, α2)
-    - α1 gates attention output, Gram branch is ungated
+    - α1 gates attention output
+    - β is separate learnable scalar for Gram branch
 
     Can be toggled on/off via use_gram_branch parameter.
     """
@@ -284,14 +284,9 @@ class DiTBlock(nn.Module):
         x_norm = nn.LayerNorm(use_bias=False, use_scale=False)(x)
         x_modulated = modulate(x_norm, shift_msa, scale_msa)  # X̃
 
-        # Attention implementation depends on whether Gram branch is enabled
-        if self.use_gram_branch:
-            # Custom attention with per-head learnable alpha gates
-            # Alpha gates favor Gram branch initially with low init values
-            alpha_heads = self.param('alpha_heads',
-                                     lambda rng, shape: jax.random.normal(rng, shape) * 0.05 + 0.1,
-                                     (self.num_heads,))
-
+        # Standard attention implementation (no per-head alpha gates)
+        if return_attn:
+            # Custom implementation to get attention weights
             head_dim = self.hidden_size // self.num_heads
             qkv = nn.Dense(3 * self.hidden_size, kernel_init=nn.initializers.xavier_uniform())(x_modulated)
             q, k, v = jnp.split(qkv, 3, axis=-1)
@@ -301,49 +296,23 @@ class DiTBlock(nn.Module):
 
             scale = head_dim ** -0.5
             attn_logits = jnp.einsum('bhqd,bhkd->bhqk', q, k) * scale
-            attn_weights = jax.nn.softmax(attn_logits, axis=-1)  # (B, H, Q, K)
-            attn_x = jnp.einsum('bhqk,bhkd->bhqd', attn_weights, v)  # (B, H, N, d)
-
-            # Apply per-head alpha gates BEFORE concat
-            attn_x = attn_x * alpha_heads[None, :, None, None]
-
-            # Concat heads and project
+            attn_weights = jax.nn.softmax(attn_logits, axis=-1)
+            attn_x = jnp.einsum('bhqk,bhkd->bhqd', attn_weights, v)
             attn_x = rearrange(attn_x, 'b h n d -> b n (h d)')
             attn_x = nn.Dense(self.hidden_size, kernel_init=nn.initializers.xavier_uniform())(attn_x)
 
-            # Store for logging
-            if return_attn:
-                attn_info = (attn_weights, alpha_heads)
+            attn_info = (attn_weights, None)
         else:
-            # Standard attention (no per-head gates) for Base DiT
-            if return_attn:
-                # Custom implementation to get attention weights
-                head_dim = self.hidden_size // self.num_heads
-                qkv = nn.Dense(3 * self.hidden_size, kernel_init=nn.initializers.xavier_uniform())(x_modulated)
-                q, k, v = jnp.split(qkv, 3, axis=-1)
-                q = rearrange(q, 'b n (h d) -> b h n d', h=self.num_heads)
-                k = rearrange(k, 'b n (h d) -> b h n d', h=self.num_heads)
-                v = rearrange(v, 'b n (h d) -> b h n d', h=self.num_heads)
-
-                scale = head_dim ** -0.5
-                attn_logits = jnp.einsum('bhqd,bhkd->bhqk', q, k) * scale
-                attn_weights = jax.nn.softmax(attn_logits, axis=-1)
-                attn_x = jnp.einsum('bhqk,bhkd->bhqd', attn_weights, v)
-                attn_x = rearrange(attn_x, 'b h n d -> b n (h d)')
-                attn_x = nn.Dense(self.hidden_size, kernel_init=nn.initializers.xavier_uniform())(attn_x)
-
-                attn_info = (attn_weights, None)  # No alpha for base DiT
-            else:
-                # Use standard Flax implementation (most efficient)
-                attn_x = nn.MultiHeadDotProductAttention(
-                    kernel_init=nn.initializers.xavier_uniform(),
-                    num_heads=self.num_heads
-                )(x_modulated, x_modulated)
+            # Use standard Flax implementation (most efficient)
+            attn_x = nn.MultiHeadDotProductAttention(
+                kernel_init=nn.initializers.xavier_uniform(),
+                num_heads=self.num_heads
+            )(x_modulated, x_modulated)
 
         # Apply attention residual with gate
         attn_residual = gate_msa[:, None] * attn_x
 
-        # Gram branch (ADDITIONAL residual if enabled)
+        # Gram branch (REPLACES identity residual if enabled)
         if self.use_gram_branch:
             # Gx = (X @ X^T) / D  (token-token Gram matrix from RAW tokens)
             # Normalize by D to keep magnitude stable
@@ -352,11 +321,12 @@ class DiTBlock(nn.Module):
             gram = jnp.matmul(x, jnp.swapaxes(x, -1, -2)) / D  # (B, N, N)
 
             # Low-rank projection: Rx = (Gx @ A) @ B
-            # IMPORTANT: Use proper order (G@A)@B to leverage low-rank efficiency
-            # A: Kaiming He init (better for deep networks)
-            # B: zeros (LoRA-style zero-init for stability)
-            A = self.param('gram_A', nn.initializers.kaiming_normal(), (num_tokens, self.gram_rank))
-            B = self.param('gram_B', nn.initializers.zeros, (self.gram_rank, self.hidden_size))
+            # Init: A, B ~ Normal(mean=0.1, std=0.05) for large initial values
+            def normal_init(rng, shape):
+                return jax.random.normal(rng, shape) * 0.05 + 0.1
+
+            A = self.param('gram_A', normal_init, (num_tokens, self.gram_rank))
+            B = self.param('gram_B', normal_init, (self.gram_rank, self.hidden_size))
 
             # Optimized matmul order: (G @ A) @ B instead of G @ (A @ B)
             rx = jnp.matmul(jnp.matmul(gram, A), B)  # (B, N, N)@(N, r) → (B, N, r) → (B, N, D)
@@ -364,20 +334,26 @@ class DiTBlock(nn.Module):
             # RMSNorm for stability
             rx_hat = RMSNorm()(rx)
 
-            # Gram residual is added DIRECTLY (NO gate, as per spec)
-            # This allows Gram to contribute independently from attention gating
-            gram_residual = rx_hat
+            # Learnable beta scalar with softplus to ensure positivity
+            # Init: b = 1.855 so that softplus(b) ≈ 2.0
+            b_raw = self.param('gram_beta_raw',
+                              lambda _: jnp.array(1.855),
+                              None)
+            beta = jax.nn.softplus(b_raw)
+
+            # Scale Gram residual by beta
+            gram_residual = beta * rx_hat
 
             # DEBUG
             if self.debug:
-                jax.debug.print("🔵 Gram: G={g_shape}, A={a_shape}, B={b_shape}, rx_norm={rn}",
+                jax.debug.print("🔵 Gram: G={g_shape}, A={a_shape}, B={b_shape}, beta={b}, rx_norm={rn}",
                                g_shape=gram.shape, a_shape=A.shape, b_shape=B.shape,
-                               rn=jnp.mean(jnp.abs(rx_hat)))
+                               b=beta, rn=jnp.mean(jnp.abs(rx_hat)))
 
-            # Combined residual: attention (gated) + Gram (ungated)
-            x = x + attn_residual + gram_residual
+            # NEW residual: attention (gated) + Gram (scaled by beta), NO identity
+            x = attn_residual + gram_residual
         else:
-            # Standard: only attention residual
+            # Standard: identity + attention residual
             x = x + attn_residual
 
         # MLP Residual (unchanged).
@@ -413,19 +389,20 @@ class DiT(nn.Module):
     Diffusion model with a Transformer backbone.
     Supports both class-label conditioning (original) and support-set conditioning (FSDiT).
 
-    Modified to support Gram branch (as per spec):
+    Modified to support Gram branch:
     - Keeps standard self-attention in all blocks (gated by α1)
-    - Optionally ADDS Gram-based low-rank residual (token-token interaction, UNGATED)
+    - Optionally REPLACES identity residual with Gram-based low-rank residual
     - Uses SAME gates/shifts as original DiT (6 per block: γ1, β1, α1, γ2, β2, α2)
     - Per block:
         if disabled: X1 = X + α1⊙MSA(X̃)
-        if enabled:  X1 = X + α1⊙MSA(X̃) + RMSNorm((XX^T/D)·A·B)
+        if enabled:  X1 = α1⊙MSA(X̃) + β·RMSNorm((XX^T/D)·A·B)
 
     Gram branch design:
     - Gram matrix from raw tokens: Gx = (X @ X^T) / D
     - Low-rank projection: Rx = (Gx @ A) @ B  (proper order for efficiency)
-    - Improved init: A: Kaiming He, B: zeros (zero-init for stability)
-    - No gate: Gram residual added directly (independent from attention gating)
+    - Init: A, B ~ Normal(mean=0.1, std=0.05) for large initial values
+    - Learnable scale: β = softplus(b), init b=1.855 → β₀=2.0
+    - NO identity residual in Gram-DiT mode
     """
     patch_size: int
     hidden_size: int
@@ -454,20 +431,18 @@ class DiT(nn.Module):
             print(f"MLP ratio: {self.mlp_ratio}")
             print(f"Gates/block: 6 (γ1, β1, α1, γ2, β2, α2) - SAME as original DiT")
             if self.use_gram_branch:
-                print(f"✅ GRAM-DiT MODE (attention + Gram branch)")
-                print(f"   Per-head alpha gates: {self.num_heads} learnable scalars")
-                print(f"   - Init: α_h ~ N(0.1, 0.05) per head (favors Gram initially)")
-                print(f"   - Attention: MSA(X̃) = Σ_h α_h · Head_h")
-                print(f"   Gram branch (ADDITIVE, UNGATED): rank={self.gram_rank}")
+                print("✅ GRAM-DiT MODE (Gram replaces identity residual)")
+                print(f"   Standard attention (no per-head gates)")
+                print(f"   Gram branch REPLACES identity: rank={self.gram_rank}")
                 print(f"   - Gram from raw X, normalized by D")
                 print(f"   - Low-rank: (G@A)@B order for efficiency")
-                print(f"   - Init: A: Kaiming He, B: zeros (zero-init)")
-                print(f"   - NO gate on Gram (independent contribution)")
-                print(f"   Output: X1 = X + α1⊙MSA_alpha(X̃) + RMSNorm((XX^T/D)·A·B)")
+                print(f"   - Init: A, B ~ Normal(mean=0.1, std=0.05)")
+                print(f"   - Learnable scale: β = softplus(b), init β₀=2.0")
+                print(f"   Output: X1 = α1⊙MSA(X̃) + β·RMSNorm((XX^T/D)·A·B)")
             else:
-                print(f"❌ BASE DiT MODE (standard attention only)")
-                print(f"   - No per-head alpha gates")
-                print(f"   - No Gram branch")
+                print("❌ BASE DiT MODE (standard attention only)")
+                print(f"   - Standard multi-head attention")
+                print(f"   - Identity residual")
                 print(f"   Output: X1 = X + α1⊙MSA(X̃)")
             print("="*80 + "\n")
 
