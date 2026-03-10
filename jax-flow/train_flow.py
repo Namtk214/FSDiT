@@ -643,17 +643,18 @@ def main(_):
                     gram_B_size = params[block_key]['gram_B'].size
                     gram_params += gram_A_size + gram_B_size
                     if i == 0:  # Print first block details
-                        print(f"\n✓ Feature-Gram branch (REPLACES identity residual):")
+                        print(f"\n✓ Reordered Gram branch (REPLACES identity residual):")
                         print(f"  - Rank: {FLAGS.model.gram_rank}")
-                        print(f"  - Gram type: X^T @ X (d×d feature correlation)")
+                        print(f"  - Computation: (X^T (XA)B)^T")
                         print(f"  - Gram_A shape: {params[block_key]['gram_A'].shape} ({gram_A_size:,} params)")
                         print(f"  - Gram_B shape: {params[block_key]['gram_B'].shape} ({gram_B_size:,} params)")
-                        print(f"  - Residual: (AB)(X^T X) where AB ∈ R^(N×d)")
+                        print(f"  - A ∈ R^(d×r), B ∈ R^(r×N)")
                         print(f"  - Init: Small normal (std=0.02) for gradient flow")
 
         if gram_params > 0:
             print(f"  - Total Gram params (A+B): {gram_params:,} ({gram_params/total_params*100:.2f}% of model)")
-            print(f"\n🔵 GRAM-DiT MODE: Feature-Gram residual REPLACES identity (no + X)")
+            print(f"\n🔵 GRAM-DiT MODE: Reordered Gram residual REPLACES identity")
+            print(f"   Formula: Y = MHSA(X) + (X^T (XA)B)^T (no + X)")
         else:
             print(f"\n⚠️  WARNING: use_gram_branch=True but no Gram params found!")
     else:

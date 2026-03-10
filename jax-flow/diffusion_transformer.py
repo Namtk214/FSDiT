@@ -242,7 +242,7 @@ class DiTBlock(nn.Module):
 
     Two modes:
     1. Base DiT (use_gram_branch=False): Standard attention with identity residual
-    2. Gram-DiT (use_gram_branch=True): Feature-Gram residual replaces identity
+    2. Gram-DiT (use_gram_branch=True): Reordered Gram residual replaces identity
 
     Base DiT mode (use_gram_branch=False):
     - Standard multi-head attention
@@ -250,12 +250,15 @@ class DiTBlock(nn.Module):
 
     Gram-DiT mode (use_gram_branch=True):
     - Standard multi-head attention (same as base)
-    - Feature-Gram residual branch REPLACES identity residual
-      - Feature Gram matrix: G = (X^T @ X) / N  (d×d feature correlation)
-      - Low-rank projection: AB where A ∈ R^(N×r), B ∈ R^(r×d)
-      - Residual: Rx = (AB)(X^T X)  →  (N×d) @ (d×d) = (N×d)
-      - Init: Small normal (stddev=0.02) for both A and B to enable gradients
-    - Output: X1 = α1⊙MSA(X̃) + RMSNorm((AB)(X^T X))
+    - Reordered Gram residual branch REPLACES identity residual
+      - Computation: (X^T (XA)B)^T where A ∈ R^(d×r), B ∈ R^(r×N)
+      - Step-by-step:
+        1. XA: (N×d) @ (d×r) → (N×r)
+        2. X^T @ XA: (d×N) @ (N×r) → (d×r)
+        3. (X^T XA) @ B: (d×r) @ (r×N) → (d×N)
+        4. Transpose: (d×N)^T → (N×d)
+      - Init: Small normal (stddev=0.02) for both A and B
+    - Output: X1 = α1⊙MSA(X̃) + RMSNorm((X^T (XA)B)^T)
 
     Key difference: NO identity residual `+ X` in Gram-DiT mode
 
@@ -314,43 +317,42 @@ class DiTBlock(nn.Module):
 
         # Gram branch (REPLACES identity residual if enabled)
         if self.use_gram_branch:
-            # Feature-feature Gram: X^T @ X (d × d) instead of token-token XX^T
-            # This captures feature correlations rather than token correlations
+            # Reordered Gram branch: (X^T (XA)B)^T
+            # This computation order enables structured feature interaction
             num_tokens = x.shape[1]
             D = self.hidden_size
 
-            # Gram = X^T @ X / N  (feature-feature correlation)
-            # Normalize by N to keep magnitude stable
-            gram = jnp.matmul(jnp.swapaxes(x, -1, -2), x) / num_tokens  # (B, D, D)
-
-            # Low-rank projection: G(X) = (AB)(X^T X)
-            # A ∈ R^(N×r), B ∈ R^(r×d) → AB ∈ R^(N×d)
+            # Low-rank projection matrices
+            # A ∈ R^(d×r), B ∈ R^(r×N)
             # Init: Small random values for gradient flow
-            # IMPORTANT: Cannot use B=zeros when REPLACING identity residual
-            # (causes dead gradient: grad_A = grad_AB @ B^T = 0)
-            # Use small normal init for both A and B to enable gradient flow
-            A = self.param('gram_A', nn.initializers.normal(stddev=0.02), (num_tokens, self.gram_rank))
-            B = self.param('gram_B', nn.initializers.normal(stddev=0.02), (self.gram_rank, self.hidden_size))
+            A = self.param('gram_A', nn.initializers.normal(stddev=0.02), (self.hidden_size, self.gram_rank))
+            B = self.param('gram_B', nn.initializers.normal(stddev=0.02), (self.gram_rank, num_tokens))
 
-            # Compute: (AB) @ (X^T X)
-            # First compute AB: (B, N, r) @ (B, r, D) → broadcast manually
-            AB = jnp.matmul(A, B)  # (N, r) @ (r, D) → (N, D)
+            # Compute: X^T @ (X @ A) @ B
+            # Step 1: XA = X @ A:  (B, N, d) @ (d, r) → (B, N, r)
+            XA = jnp.matmul(x, A)
 
-            # Then multiply with Gram: (AB) @ Gram
-            # AB: (N, D), Gram: (B, D, D) → need to broadcast AB to (B, N, D)
-            rx = jnp.matmul(AB[None, :, :], gram)  # (1, N, D) @ (B, D, D) → (B, N, D)
+            # Step 2: X^T @ XA:  (B, d, N) @ (B, N, r) → (B, d, r)
+            X_T_XA = jnp.matmul(jnp.swapaxes(x, -1, -2), XA)
+
+            # Step 3: (X^T XA) @ B:  (B, d, r) @ (r, N) → (B, d, N)
+            temp = jnp.matmul(X_T_XA, B)
+
+            # Step 4: Transpose to get (B, N, d)
+            rx = jnp.swapaxes(temp, -1, -2)  # (B, d, N) → (B, N, d)
 
             # RMSNorm for stability
             rx_hat = RMSNorm()(rx)
 
-            # Gram residual (no beta scaling)
+            # Gram residual
             gram_residual = rx_hat
 
             # DEBUG
             if self.debug:
-                jax.debug.print("🔵 Gram: G={g_shape}, A={a_shape}, B={b_shape}, AB={ab_shape}, rx_norm={rn}",
-                               g_shape=gram.shape, a_shape=A.shape, b_shape=B.shape,
-                               ab_shape=AB.shape, rn=jnp.mean(jnp.abs(rx_hat)))
+                jax.debug.print("🔵 Gram: A={a_shape}, B={b_shape}, XA={xa_shape}, X_T_XA={xt_xa_shape}, temp={temp_shape}, rx={rx_shape}, rx_norm={rn}",
+                               a_shape=A.shape, b_shape=B.shape, xa_shape=XA.shape,
+                               xt_xa_shape=X_T_XA.shape, temp_shape=temp.shape, rx_shape=rx.shape,
+                               rn=jnp.mean(jnp.abs(rx_hat)))
 
             # NEW residual: attention (gated) + Gram, NO identity
             x = attn_residual + gram_residual
@@ -391,19 +393,19 @@ class DiT(nn.Module):
     Diffusion model with a Transformer backbone.
     Supports both class-label conditioning (original) and support-set conditioning (FSDiT).
 
-    Modified to support Feature-Gram branch:
+    Modified to support Reordered Gram branch:
     - Keeps standard self-attention in all blocks (gated by α1)
-    - Optionally REPLACES identity residual with Feature-Gram residual
+    - Optionally REPLACES identity residual with Reordered Gram residual
     - Uses SAME gates/shifts as original DiT (6 per block: γ1, β1, α1, γ2, β2, α2)
     - Per block:
         if disabled: X1 = X + α1⊙MSA(X̃)
-        if enabled:  X1 = α1⊙MSA(X̃) + RMSNorm((AB)(X^T X))
+        if enabled:  X1 = α1⊙MSA(X̃) + RMSNorm((X^T (XA)B)^T)
 
-    Feature-Gram branch design:
-    - Feature Gram: G = (X^T @ X) / N  (d×d feature-feature correlation)
-    - Low-rank matrices: A ∈ R^(N×r), B ∈ R^(r×d)
-    - Residual: (AB)(X^T X) where AB ∈ R^(N×d), result ∈ R^(N×d)
-    - Init: Small normal (stddev=0.02) for gradient flow (B≠0 to avoid dead gradient)
+    Reordered Gram branch design:
+    - Computation order: X^T @ (X @ A) @ B, then transpose
+    - Low-rank matrices: A ∈ R^(d×r), B ∈ R^(r×N)
+    - Enables structured feature interaction through reordered matmul
+    - Init: Small normal (stddev=0.02) for gradient flow
     - NO identity residual in Gram-DiT mode
     """
     patch_size: int
@@ -433,14 +435,14 @@ class DiT(nn.Module):
             print(f"MLP ratio: {self.mlp_ratio}")
             print(f"Gates/block: 6 (γ1, β1, α1, γ2, β2, α2) - SAME as original DiT")
             if self.use_gram_branch:
-                print("✅ GRAM-DiT MODE (Feature-Gram replaces identity residual)")
+                print("✅ GRAM-DiT MODE (Reordered Gram replaces identity residual)")
                 print(f"   Standard attention (no per-head gates)")
-                print(f"   Feature-Gram branch REPLACES identity: rank={self.gram_rank}")
-                print(f"   - Feature Gram: X^T @ X (d×d feature correlation)")
-                print(f"   - Normalized by N (num tokens)")
-                print(f"   - Low-rank: (AB) @ (X^T X) where AB ∈ R^(N×d)")
+                print(f"   Reordered Gram branch REPLACES identity: rank={self.gram_rank}")
+                print(f"   - Computation: (X^T (XA)B)^T")
+                print(f"   - Low-rank matrices: A ∈ R^(d×r), B ∈ R^(r×N)")
+                print(f"   - Steps: XA → X^T·XA → (X^T·XA)B → transpose")
                 print(f"   - Init: Small normal (std=0.02) for A, B to enable gradients")
-                print(f"   Output: X1 = α1⊙MSA(X̃) + RMSNorm((AB)(X^T X))")
+                print(f"   Output: X1 = α1⊙MSA(X̃) + RMSNorm((X^T (XA)B)^T)")
             else:
                 print("❌ BASE DiT MODE (standard attention only)")
                 print(f"   - Standard multi-head attention")
