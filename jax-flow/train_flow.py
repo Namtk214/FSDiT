@@ -440,13 +440,11 @@ class FlowTrainer(flax.struct.PyTreeNode):
         info['update_norm'] = optax.global_norm(updates)
         info['param_norm'] = optax.global_norm(new_params)
 
-        # Extract Gram branch gradients and beta values for logging
+        # Extract Gram branch gradients for logging
         if self.config.get('use_gram_branch', False):
-            # Collect gradients and beta values from all blocks
+            # Collect gradients from all blocks
             gram_A_grads = []
             gram_B_grads = []
-            gram_beta_grads = []
-            beta_values = []
 
             for i in range(self.config['depth']):
                 block_key = f'DiTBlock_{i}'
@@ -456,25 +454,12 @@ class FlowTrainer(flax.struct.PyTreeNode):
                         gram_A_grads.append(grads[block_key]['gram_A'])
                     if 'gram_B' in grads[block_key]:
                         gram_B_grads.append(grads[block_key]['gram_B'])
-                    if 'gram_beta_raw' in grads[block_key]:
-                        gram_beta_grads.append(grads[block_key]['gram_beta_raw'])
-                    # Beta values: softplus(gram_beta_raw) from params
-                    if 'gram_beta_raw' in new_params[block_key]:
-                        beta_raw = new_params[block_key]['gram_beta_raw']
-                        beta = jax.nn.softplus(beta_raw)
-                        beta_values.append(beta)
 
             # Compute gradient norms
             if gram_A_grads:
                 info['gram_A_grad_norm'] = optax.global_norm(gram_A_grads)
             if gram_B_grads:
                 info['gram_B_grad_norm'] = optax.global_norm(gram_B_grads)
-            if gram_beta_grads:
-                info['gram_beta_grad_norm'] = optax.global_norm(gram_beta_grads)
-
-            # Store beta values (all blocks)
-            if beta_values:
-                info['beta_values'] = jnp.stack(beta_values)  # Shape: (depth,)
 
         # Update EMA loss
         beta = self.config.get('loss_ema_beta', 0.99)
@@ -650,7 +635,6 @@ def main(_):
     # Count Gram params (only if enabled)
     if FLAGS.model.use_gram_branch:
         gram_params = 0
-        beta_params = 0
         for i in range(FLAGS.model.depth):
             block_key = f'DiTBlock_{i}'
             if block_key in params:
@@ -659,19 +643,16 @@ def main(_):
                     gram_B_size = params[block_key]['gram_B'].size
                     gram_params += gram_A_size + gram_B_size
                     if i == 0:  # Print first block details
-                        print(f"\n✓ Gram branch (REPLACES identity residual):")
+                        print(f"\n✓ Feature-Gram branch (REPLACES identity residual):")
                         print(f"  - Rank: {FLAGS.model.gram_rank}")
+                        print(f"  - Gram type: X^T @ X (d×d feature correlation)")
                         print(f"  - Gram_A shape: {params[block_key]['gram_A'].shape} ({gram_A_size:,} params)")
                         print(f"  - Gram_B shape: {params[block_key]['gram_B'].shape} ({gram_B_size:,} params)")
-                # Count beta parameters
-                if 'gram_beta_raw' in params[block_key]:
-                    beta_params += params[block_key]['gram_beta_raw'].size
+                        print(f"  - Residual: (AB)(X^T X) where AB ∈ R^(N×d)")
 
         if gram_params > 0:
             print(f"  - Total Gram params (A+B): {gram_params:,} ({gram_params/total_params*100:.2f}% of model)")
-            if beta_params > 0:
-                print(f"  - Beta scale params: {beta_params:,} ({beta_params} scalars × {FLAGS.model.depth} blocks)")
-            print(f"\n🔵 GRAM-DiT MODE: Gram residual REPLACES identity (no + X)")
+            print(f"\n🔵 GRAM-DiT MODE: Feature-Gram residual REPLACES identity (no + X)")
         else:
             print(f"\n⚠️  WARNING: use_gram_branch=True but no Gram params found!")
     else:
@@ -1037,12 +1018,6 @@ def main(_):
 
         if i % FLAGS.log_interval == 0:
             update_info = jax.tree.map(lambda x: np.array(x), update_info)
-
-            # Extract beta_values BEFORE .mean() to preserve per-block dimension
-            beta_values_raw = None
-            if FLAGS.model.use_gram_branch and 'beta_values' in update_info:
-                beta_values_raw = update_info['beta_values']  # Shape: (devices, depth)
-
             update_info = jax.tree.map(lambda x: x.mean(), update_info)
 
             # Calculate throughput (TFLOPs per second)
@@ -1070,20 +1045,6 @@ def main(_):
                     train_metrics['gram/A_grad_norm'] = float(update_info['gram_A_grad_norm'])
                 if 'gram_B_grad_norm' in update_info:
                     train_metrics['gram/B_grad_norm'] = float(update_info['gram_B_grad_norm'])
-                if 'gram_beta_grad_norm' in update_info:
-                    train_metrics['gram/beta_grad_norm'] = float(update_info['gram_beta_grad_norm'])
-
-                # Log per-block beta values (use preserved raw version)
-                if beta_values_raw is not None:
-                    # Average across devices but keep per-block dimension: (devices, depth) -> (depth,)
-                    beta_values = np.array(beta_values_raw).mean(axis=0)
-                    for block_idx in range(len(beta_values)):
-                        train_metrics[f'beta/block_{block_idx}'] = float(beta_values[block_idx])
-                    # Also log mean/std/min/max for summary
-                    train_metrics['beta/mean'] = float(jnp.mean(beta_values))
-                    train_metrics['beta/std'] = float(jnp.std(beta_values))
-                    train_metrics['beta/min'] = float(jnp.min(beta_values))
-                    train_metrics['beta/max'] = float(jnp.max(beta_values))
 
             if jax.process_index() == 0:
                 wandb.log(train_metrics, step=i)
