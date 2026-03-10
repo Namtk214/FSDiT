@@ -254,7 +254,7 @@ class DiTBlock(nn.Module):
       - Feature Gram matrix: G = (X^T @ X) / N  (d×d feature correlation)
       - Low-rank projection: AB where A ∈ R^(N×r), B ∈ R^(r×d)
       - Residual: Rx = (AB)(X^T X)  →  (N×d) @ (d×d) = (N×d)
-      - Init: LoRA-style (A: Kaiming, B: zeros → AB = 0 initially)
+      - Init: Small normal (stddev=0.02) for both A and B to enable gradients
     - Output: X1 = α1⊙MSA(X̃) + RMSNorm((AB)(X^T X))
 
     Key difference: NO identity residual `+ X` in Gram-DiT mode
@@ -325,11 +325,12 @@ class DiTBlock(nn.Module):
 
             # Low-rank projection: G(X) = (AB)(X^T X)
             # A ∈ R^(N×r), B ∈ R^(r×d) → AB ∈ R^(N×d)
-            # Init: LoRA-style for training stability
-            # - A: Kaiming/Normal init (provides initial signal)
-            # - B: Zero init (ensures AB = 0 initially, no effect on output)
-            A = self.param('gram_A', nn.initializers.kaiming_normal(), (num_tokens, self.gram_rank))
-            B = self.param('gram_B', nn.initializers.zeros, (self.gram_rank, self.hidden_size))
+            # Init: Small random values for gradient flow
+            # IMPORTANT: Cannot use B=zeros when REPLACING identity residual
+            # (causes dead gradient: grad_A = grad_AB @ B^T = 0)
+            # Use small normal init for both A and B to enable gradient flow
+            A = self.param('gram_A', nn.initializers.normal(stddev=0.02), (num_tokens, self.gram_rank))
+            B = self.param('gram_B', nn.initializers.normal(stddev=0.02), (self.gram_rank, self.hidden_size))
 
             # Compute: (AB) @ (X^T X)
             # First compute AB: (B, N, r) @ (B, r, D) → broadcast manually
@@ -402,7 +403,7 @@ class DiT(nn.Module):
     - Feature Gram: G = (X^T @ X) / N  (d×d feature-feature correlation)
     - Low-rank matrices: A ∈ R^(N×r), B ∈ R^(r×d)
     - Residual: (AB)(X^T X) where AB ∈ R^(N×d), result ∈ R^(N×d)
-    - Init: LoRA-style (A: Kaiming normal, B: zeros → AB = 0 initially)
+    - Init: Small normal (stddev=0.02) for gradient flow (B≠0 to avoid dead gradient)
     - NO identity residual in Gram-DiT mode
     """
     patch_size: int
@@ -438,7 +439,7 @@ class DiT(nn.Module):
                 print(f"   - Feature Gram: X^T @ X (d×d feature correlation)")
                 print(f"   - Normalized by N (num tokens)")
                 print(f"   - Low-rank: (AB) @ (X^T X) where AB ∈ R^(N×d)")
-                print(f"   - Init: LoRA-style (A: Kaiming, B: zeros → AB=0 initially)")
+                print(f"   - Init: Small normal (std=0.02) for A, B to enable gradients")
                 print(f"   Output: X1 = α1⊙MSA(X̃) + RMSNorm((AB)(X^T X))")
             else:
                 print("❌ BASE DiT MODE (standard attention only)")

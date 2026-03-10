@@ -649,7 +649,7 @@ def main(_):
                         print(f"  - Gram_A shape: {params[block_key]['gram_A'].shape} ({gram_A_size:,} params)")
                         print(f"  - Gram_B shape: {params[block_key]['gram_B'].shape} ({gram_B_size:,} params)")
                         print(f"  - Residual: (AB)(X^T X) where AB ∈ R^(N×d)")
-                        print(f"  - Init: LoRA-style (A: Kaiming, B: zeros)")
+                        print(f"  - Init: Small normal (std=0.02) for gradient flow")
 
         if gram_params > 0:
             print(f"  - Total Gram params (A+B): {gram_params:,} ({gram_params/total_params*100:.2f}% of model)")
