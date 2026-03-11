@@ -242,7 +242,7 @@ class DiTBlock(nn.Module):
 
     Two modes:
     1. Base DiT (use_gram_branch=False): Standard attention with identity residual
-    2. Gram-DiT (use_gram_branch=True): Reordered Gram residual replaces identity
+    2. Gram-DiT (use_gram_branch=True): ADDS reordered Gram branch to residual
 
     Base DiT mode (use_gram_branch=False):
     - Standard multi-head attention
@@ -250,17 +250,18 @@ class DiTBlock(nn.Module):
 
     Gram-DiT mode (use_gram_branch=True):
     - Standard multi-head attention (same as base)
-    - Reordered Gram residual branch REPLACES identity residual
-      - Computation: (X^T (XA)B)^T where A ∈ R^(d×r), B ∈ R^(r×N)
+    - Reordered Gram branch ADDED to identity + attention
+      - Computation: (X^T (XA)B)^T / N where A ∈ R^(d×r), B ∈ R^(r×N)
       - Step-by-step:
         1. XA: (N×d) @ (d×r) → (N×r)
         2. X^T @ XA: (d×N) @ (N×r) → (d×r)
         3. (X^T XA) @ B: (d×r) @ (r×N) → (d×N)
         4. Transpose: (d×N)^T → (N×d)
+        5. Normalize: / N
       - Init: Small normal (stddev=0.02) for both A and B
-    - Output: X1 = α1⊙MSA(X̃) + RMSNorm((X^T (XA)B)^T)
+    - Output: X1 = X + α1⊙MSA(X̃) + RMSNorm((X^T (XA)B)^T / N)
 
-    Key difference: NO identity residual `+ X` in Gram-DiT mode
+    Key difference: Gram branch is ADDITIVE (does NOT replace identity)
 
     Architecture:
     - Maintains 6 gates like original DiT (γ1, β1, α1, γ2, β2, α2)
@@ -287,7 +288,7 @@ class DiTBlock(nn.Module):
         x_norm = nn.LayerNorm(use_bias=False, use_scale=False)(x)
         x_modulated = modulate(x_norm, shift_msa, scale_msa)  # X̃
 
-        # Standard attention implementation (no per-head alpha gates)
+        # Standard attention implementation 
         if return_attn:
             # Custom implementation to get attention weights
             head_dim = self.hidden_size // self.num_heads
@@ -315,12 +316,11 @@ class DiTBlock(nn.Module):
         # Apply attention residual with gate
         attn_residual = gate_msa[:, None] * attn_x
 
-        # Gram branch (REPLACES identity residual if enabled)
+        # Gram branch (ADDITIVE to both identity and attention)
         if self.use_gram_branch:
-            # Reordered Gram branch: (X^T (XA)B)^T
+            # Reordered Gram branch: (X^T (XA)B)^T / N
             # This computation order enables structured feature interaction
             num_tokens = x.shape[1]
-            D = self.hidden_size
 
             # Low-rank projection matrices
             # A ∈ R^(d×r), B ∈ R^(r×N)
@@ -328,7 +328,7 @@ class DiTBlock(nn.Module):
             A = self.param('gram_A', nn.initializers.normal(stddev=0.02), (self.hidden_size, self.gram_rank))
             B = self.param('gram_B', nn.initializers.normal(stddev=0.02), (self.gram_rank, num_tokens))
 
-            # Compute: X^T @ (X @ A) @ B
+            # Compute: X^T @ (X @ A) @ B / N
             # Step 1: XA = X @ A:  (B, N, d) @ (d, r) → (B, N, r)
             XA = jnp.matmul(x, A)
 
@@ -340,6 +340,9 @@ class DiTBlock(nn.Module):
 
             # Step 4: Transpose to get (B, N, d)
             rx = jnp.swapaxes(temp, -1, -2)  # (B, d, N) → (B, N, d)
+
+            # Normalize by N (number of tokens) for stability
+            rx = rx / num_tokens
 
             # RMSNorm for stability
             rx_hat = RMSNorm()(rx)
@@ -354,8 +357,8 @@ class DiTBlock(nn.Module):
                                xt_xa_shape=X_T_XA.shape, temp_shape=temp.shape, rx_shape=rx.shape,
                                rn=jnp.mean(jnp.abs(rx_hat)))
 
-            # NEW residual: attention (gated) + Gram, NO identity
-            x = attn_residual + gram_residual
+            # ADDITIVE residual: identity + attention (gated) + Gram
+            x = x + attn_residual + gram_residual
         else:
             # Standard: identity + attention residual
             x = x + attn_residual
@@ -395,18 +398,18 @@ class DiT(nn.Module):
 
     Modified to support Reordered Gram branch:
     - Keeps standard self-attention in all blocks (gated by α1)
-    - Optionally REPLACES identity residual with Reordered Gram residual
+    - Optionally ADDS Reordered Gram branch to identity + attention
     - Uses SAME gates/shifts as original DiT (6 per block: γ1, β1, α1, γ2, β2, α2)
     - Per block:
         if disabled: X1 = X + α1⊙MSA(X̃)
-        if enabled:  X1 = α1⊙MSA(X̃) + RMSNorm((X^T (XA)B)^T)
+        if enabled:  X1 = X + α1⊙MSA(X̃) + RMSNorm((X^T (XA)B)^T / N)
 
     Reordered Gram branch design:
-    - Computation order: X^T @ (X @ A) @ B, then transpose
+    - Computation order: X^T @ (X @ A) @ B / N, then transpose
     - Low-rank matrices: A ∈ R^(d×r), B ∈ R^(r×N)
     - Enables structured feature interaction through reordered matmul
     - Init: Small normal (stddev=0.02) for gradient flow
-    - NO identity residual in Gram-DiT mode
+    - ADDITIVE to identity residual (not replacing)
     """
     patch_size: int
     hidden_size: int
@@ -435,14 +438,14 @@ class DiT(nn.Module):
             print(f"MLP ratio: {self.mlp_ratio}")
             print(f"Gates/block: 6 (γ1, β1, α1, γ2, β2, α2) - SAME as original DiT")
             if self.use_gram_branch:
-                print("✅ GRAM-DiT MODE (Reordered Gram replaces identity residual)")
+                print("✅ GRAM-DiT MODE (Reordered Gram ADDITIVE to identity)")
                 print(f"   Standard attention (no per-head gates)")
-                print(f"   Reordered Gram branch REPLACES identity: rank={self.gram_rank}")
-                print(f"   - Computation: (X^T (XA)B)^T")
+                print(f"   Reordered Gram branch ADDS to identity: rank={self.gram_rank}")
+                print(f"   - Computation: (X^T (XA)B)^T / N")
                 print(f"   - Low-rank matrices: A ∈ R^(d×r), B ∈ R^(r×N)")
-                print(f"   - Steps: XA → X^T·XA → (X^T·XA)B → transpose")
+                print(f"   - Steps: XA → X^T·XA → (X^T·XA)B → transpose → /N")
                 print(f"   - Init: Small normal (std=0.02) for A, B to enable gradients")
-                print(f"   Output: X1 = α1⊙MSA(X̃) + RMSNorm((X^T (XA)B)^T)")
+                print(f"   Output: X1 = X + α1⊙MSA(X̃) + RMSNorm((X^T (XA)B)^T / N)")
             else:
                 print("❌ BASE DiT MODE (standard attention only)")
                 print(f"   - Standard multi-head attention")
