@@ -542,6 +542,43 @@ class FlowTrainer(flax.struct.PyTreeNode):
     def call_model_pmap(self, images, t, labels, cfg=True, cfg_val=1.0):
         return self.call_model(images, t, labels, cfg=cfg, cfg_val=cfg_val)
 
+    @partial(jax.jit, static_argnames=('cfg',))
+    def call_model_with_blocks(self, images, t, labels, cfg=True, cfg_val=1.0):
+        """Call model with block tokens for similarity analysis"""
+        if self.config['t_conditioning'] == 0:
+            t = jnp.zeros_like(t)
+
+        if not cfg:
+            # No CFG, just return prediction and block tokens
+            return self.model_eps(images, t, labels, train=False, force_drop_ids=False, return_block_tokens=True)
+        else:
+            # CFG: duplicate batch
+            labels_uncond = jnp.ones(labels.shape, dtype=jnp.int32) * self.config['num_classes']
+            images_expanded = jnp.tile(images, (2, 1, 1, 1))
+            t_expanded = jnp.tile(t, (2,))
+            labels_full = jnp.concatenate([labels, labels_uncond], axis=0)
+
+            # Get prediction and block tokens
+            v_pred, block_tokens = self.model_eps(
+                images_expanded, t_expanded, labels_full,
+                train=False, force_drop_ids=False, return_block_tokens=True
+            )
+
+            # Split and apply CFG
+            v_label = v_pred[:images.shape[0]]
+            v_uncond = v_pred[images.shape[0]:]
+            v = v_uncond + cfg_val * (v_label - v_uncond)
+
+            # Also split block tokens (return conditional branch only)
+            block_tokens_cond = [bt[:images.shape[0]] for bt in block_tokens]
+
+            return v, block_tokens_cond
+
+    @partial(jax.pmap, axis_name='data')
+    def call_model_with_blocks_pmap(self, images, t, labels, cfg=True, cfg_val=1.0):
+        """Pmap version of call_model_with_blocks"""
+        return self.call_model_with_blocks(images, t, labels, cfg=cfg, cfg_val=cfg_val)
+
 ##############################################
 ## Training Code.
 ##############################################
@@ -1031,7 +1068,8 @@ def main(_):
                 plt.close(fig)
 
         # Block similarity analysis (every 50000 steps)
-        if i % 50000 == 0 and jax.process_index() == 0:
+        # Đang để ở 10k steps
+        if i % 10000 == 0 and jax.process_index() == 0:
             print(f"\n[Step {i}] Computing block-wise cosine similarity...")
 
             # Track specific timesteps as per guide
@@ -1055,43 +1093,23 @@ def main(_):
 
                 # Check if we should track this timestep
                 if ti in track_timesteps:
-                    # Get predictions with block tokens
-                    # Note: call_model_pmap doesn't support return_block_tokens yet
-                    # So we need to call the underlying model directly
-                    # Unflatten pmap dimension for model call
-                    x_flat = x_sim.reshape(-1, *x_sim.shape[2:])  # (devices*batch, H, W, C)
-                    t_flat = t_vec.reshape(-1)  # (devices*batch,)
-                    labels_flat = sim_labels.reshape(-1)  # (devices*batch,)
-
-                    # For CFG: duplicate batch
-                    num_classes = FLAGS.model.num_classes
-                    labels_uncond = jnp.ones_like(labels_flat) * num_classes
-                    x_expanded = jnp.tile(x_flat, (2, 1, 1, 1))
-                    t_expanded = jnp.tile(t_flat, (2,))
-                    labels_full = jnp.concatenate([labels_flat, labels_uncond], axis=0)
-
-                    # Get v_pred and block tokens
-                    v_pred, block_tokens = model.model_eps.apply_fn(
-                        {'params': model.model_eps.params},
-                        x_expanded, t_expanded, labels_full,
-                        train=False, force_drop_ids=False, return_block_tokens=True
+                    # Get predictions with block tokens using pmap function
+                    v_final, block_tokens_all = model.call_model_with_blocks_pmap(
+                        x_sim, t_vec, sim_labels, True, FLAGS.model.cfg_scale
                     )
 
-                    # Extract conditional branch only (first half of batch)
-                    batch_total = x_flat.shape[0]
-                    block_tokens_cond = [bt[:batch_total] for bt in block_tokens]
+                    # block_tokens_all is already from conditional branch only
+                    # Shape: each tensor in list is (devices, batch, N, D)
+                    # Flatten device and batch dimensions for similarity computation
+                    block_tokens_flat = []
+                    for bt in block_tokens_all:
+                        # bt shape: (devices, batch, N, D)
+                        bt_flat = bt.reshape(-1, *bt.shape[2:])  # (devices*batch, N, D)
+                        block_tokens_flat.append(bt_flat)
 
                     # Compute similarity matrix
-                    sim_mat = compute_block_cosine_matrix(block_tokens_cond)
+                    sim_mat = compute_block_cosine_matrix(block_tokens_flat)
                     similarity_data[ti] = np.array(sim_mat)
-
-                    # Use conditional predictions for sampling (CFG)
-                    v_pred_cond = v_pred[:batch_total]
-                    v_pred_uncond = v_pred[batch_total:]
-                    v_final = v_pred_uncond + FLAGS.model.cfg_scale * (v_pred_cond - v_pred_uncond)
-
-                    # Reshape back to pmap format
-                    v_final = v_final.reshape(x_sim.shape)
                 else:
                     # Normal prediction without block tokens
                     v_final = model.call_model_pmap(x_sim, t_vec, sim_labels, True, FLAGS.model.cfg_scale)
