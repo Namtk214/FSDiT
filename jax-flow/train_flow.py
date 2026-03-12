@@ -109,9 +109,9 @@ def compute_block_cosine_matrix(block_tokens):
     # Normalize along hidden dimension
     H_norm = H / (jnp.linalg.norm(H, axis=-1, keepdims=True) + 1e-8)
 
-    # Compute pairwise cosine: (L, 1, B, N, D) * (1, L, B, N, D)
-    # Then sum over D to get cosine values
-    cosine_vals = jnp.einsum('labnd,lbbnd->labn', H_norm[:, None], H_norm[None, :])
+    # Compute pairwise cosine: for each pair of blocks (i, j), compute dot product
+    # H_norm shape: (L, B, N, D), output shape: (L, L, B, N)
+    cosine_vals = jnp.einsum('ibnd,jbnd->ijbn', H_norm, H_norm)
 
     # Average over batch and tokens: (L, L, B, N) -> (L, L)
     sim_mat = jnp.mean(cosine_vals, axis=(-2, -1))
