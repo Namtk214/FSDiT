@@ -574,7 +574,7 @@ class FlowTrainer(flax.struct.PyTreeNode):
 
             return v, block_tokens_cond
 
-    @partial(jax.pmap, axis_name='data')
+    @partial(jax.pmap, axis_name='data', in_axes=(0, 0, 0, 0), static_broadcasted_argnums=(4,5))
     def call_model_with_blocks_pmap(self, images, t, labels, cfg=True, cfg_val=1.0):
         """Pmap version of call_model_with_blocks"""
         return self.call_model_with_blocks(images, t, labels, cfg=cfg, cfg_val=cfg_val)
