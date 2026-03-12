@@ -1069,7 +1069,7 @@ def main(_):
 
         # Block similarity analysis (every 50000 steps)
         # Đang để ở 1k steps
-        if i % 100 == 0 and jax.process_index() == 0:
+        if i % 50000 == 0 and jax.process_index() == 0:
             print(f"\n[Step {i}] Computing block-wise cosine similarity...")
 
             # Track specific timesteps as per guide
