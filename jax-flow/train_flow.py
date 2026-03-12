@@ -68,6 +68,11 @@ model_config = ml_collections.ConfigDict({
     # Gram branch support (new)
     'use_gram_branch': False,   # Set to True to enable Gram branch
     'gram_rank': 64,           # Low-rank dimension for Gram branch
+    # Block cosine-squared regularization
+    'use_block_reg': True,    # Enable block-wise cosine-squared regularization
+    'lambda_block_04': 1e-4,   # Weight for block 0 vs block 4 regularization
+    'lambda_block_4_10': 1e-3, # Weight for block 4 vs block 10 regularization
+    'lambda_block_10_11': 1e-2, # Weight for block 10 vs block 11 regularization
     # Logging
     'loss_ema_beta': 0.99,     # EMA smoothing factor for loss
     # Debug
@@ -117,6 +122,32 @@ def compute_block_cosine_matrix(block_tokens):
     sim_mat = jnp.mean(cosine_vals, axis=(-2, -1))
 
     return sim_mat
+
+
+def block_cos2_reg(h_a, h_b, eps=1e-8):
+    """
+    Compute cosine-squared regularization between two block outputs.
+
+    This regularizer encourages the two blocks to have decorrelated representations
+    by penalizing high cosine similarity (both positive and negative).
+
+    Args:
+        h_a: tensor of shape (B, N, D) - output from block a
+        h_b: tensor of shape (B, N, D) - output from block b
+        eps: small constant for numerical stability
+
+    Returns:
+        scalar: mean of squared cosine similarity values across all tokens
+    """
+    # Normalize along hidden dimension
+    h_a_norm = h_a / (jnp.linalg.norm(h_a, axis=-1, keepdims=True) + eps)
+    h_b_norm = h_b / (jnp.linalg.norm(h_b, axis=-1, keepdims=True) + eps)
+
+    # Compute cosine similarity for each token: (B, N)
+    cos = jnp.sum(h_a_norm * h_b_norm, axis=-1)
+
+    # Return mean of squared cosine
+    return jnp.mean(cos ** 2)
 
 
 ##############################################
@@ -454,13 +485,54 @@ class FlowTrainer(flax.struct.PyTreeNode):
             v_t = get_v(images, eps)
             if self.config['t_conditioning'] == 0:
                 t = jnp.zeros_like(t)
-            v_prime = self.model(x_t, t, labels, train=True, rngs={'label_dropout': label_key}, params=params)
-            loss = jnp.mean((v_prime - v_t) ** 2)
-            return loss, {
-                'l2_loss': loss,
-                'v_abs_mean': jnp.abs(v_t).mean(),
-                'v_pred_abs_mean': jnp.abs(v_prime).mean(),
-            }
+
+            # Check if we need block tokens for regularization
+            use_block_reg = self.config.get('use_block_reg', False)
+
+            if use_block_reg:
+                # Call model with return_block_tokens=True
+                v_prime, block_tokens = self.model(
+                    x_t, t, labels, train=True,
+                    rngs={'label_dropout': label_key},
+                    params=params,
+                    return_block_tokens=True
+                )
+
+                # Compute generation loss
+                l2_loss = jnp.mean((v_prime - v_t) ** 2)
+
+                # Compute block regularization terms
+                # For DiT-B/12 (depth=12), valid indices are 0-11
+                r_04 = block_cos2_reg(block_tokens[0], block_tokens[4])
+                r_4_10 = block_cos2_reg(block_tokens[4], block_tokens[10])
+                r_10_11 = block_cos2_reg(block_tokens[10], block_tokens[11])
+
+                # Get lambda weights from config
+                lambda_04 = self.config.get('lambda_block_04', 1e-4)
+                lambda_4_10 = self.config.get('lambda_block_4_10', 1e-4)
+                lambda_10_11 = self.config.get('lambda_block_10_11', 1e-4)
+
+                # Total loss with regularization
+                loss = l2_loss + lambda_04 * r_04 + lambda_4_10 * r_4_10 + lambda_10_11 * r_10_11
+
+                return loss, {
+                    'l2_loss': l2_loss,
+                    'block_reg_04': r_04,
+                    'block_reg_4_10': r_4_10,
+                    'block_reg_10_11': r_10_11,
+                    'total_loss': loss,
+                    'v_abs_mean': jnp.abs(v_t).mean(),
+                    'v_pred_abs_mean': jnp.abs(v_prime).mean(),
+                }
+            else:
+                # Standard forward without block tokens
+                v_prime = self.model(x_t, t, labels, train=True, rngs={'label_dropout': label_key}, params=params)
+                loss = jnp.mean((v_prime - v_t) ** 2)
+                return loss, {
+                    'l2_loss': loss,
+                    'v_abs_mean': jnp.abs(v_t).mean(),
+                    'v_pred_abs_mean': jnp.abs(v_prime).mean(),
+                }
 
         grads, info = jax.grad(loss_fn, has_aux=True)(self.model.params)
         grads = jax.lax.pmean(grads, axis_name=pmap_axis)
@@ -731,6 +803,18 @@ def main(_):
             print(f"\n⚠️  WARNING: use_gram_branch=True but no Gram params found!")
     else:
         print(f"\n❌ Standard DiT: Identity residual (X + attention)")
+
+    # Block regularization info
+    if FLAGS.model.use_block_reg:
+        print(f"\n🔵 BLOCK REGULARIZATION ENABLED:")
+        print(f"  - Regularizing block pairs: (0,4), (4,10), (10,11)")
+        print(f"  - Lambda weights:")
+        print(f"    - λ_04:    {FLAGS.model.lambda_block_04:.2e}")
+        print(f"    - λ_4_10:  {FLAGS.model.lambda_block_4_10:.2e}")
+        print(f"    - λ_10_11: {FLAGS.model.lambda_block_10_11:.2e}")
+        print(f"  - Loss: L_total = L_gen + λ_04*R_04 + λ_4_10*R_4_10 + λ_10_11*R_10_11")
+    else:
+        print(f"\n❌ Block regularization disabled")
 
     print("="*80 + "\n")
 
@@ -1190,6 +1274,17 @@ def main(_):
                     train_metrics['gram/A_grad_norm'] = float(update_info['gram_A_grad_norm'])
                 if 'gram_B_grad_norm' in update_info:
                     train_metrics['gram/B_grad_norm'] = float(update_info['gram_B_grad_norm'])
+
+            # Add block regularization metrics if enabled
+            if FLAGS.model.use_block_reg:
+                if 'block_reg_04' in update_info:
+                    train_metrics['block_reg/R_04'] = float(update_info['block_reg_04'])
+                if 'block_reg_4_10' in update_info:
+                    train_metrics['block_reg/R_4_10'] = float(update_info['block_reg_4_10'])
+                if 'block_reg_10_11' in update_info:
+                    train_metrics['block_reg/R_10_11'] = float(update_info['block_reg_10_11'])
+                if 'total_loss' in update_info:
+                    train_metrics['train/total_loss'] = float(update_info['total_loss'])
 
             if jax.process_index() == 0:
                 wandb.log(train_metrics, step=i)
