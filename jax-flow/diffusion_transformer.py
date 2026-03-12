@@ -454,7 +454,7 @@ class DiT(nn.Module):
             print("="*80 + "\n")
 
     @nn.compact
-    def __call__(self, x, t, y, train=False, force_drop_ids=None, return_attn=False):
+    def __call__(self, x, t, y, train=False, force_drop_ids=None, return_attn=False, return_block_tokens=False):
         """
         Args:
             x: (B, H, W, C) — noisy image (or latent)
@@ -463,6 +463,7 @@ class DiT(nn.Module):
             train: bool
             force_drop_ids: for CFG
             return_attn: if True, also return attention weights per layer
+            return_block_tokens: if True, also return hidden tokens after each block
         """
         batch_size = x.shape[0]
         input_size = x.shape[1]
@@ -496,6 +497,8 @@ class DiT(nn.Module):
         # print("DiT: Label Embedding of shape", y.shape)
 
         attn_weights_all = [] if return_attn else None
+        block_tokens_all = [] if return_block_tokens else None
+
         for _ in range(self.depth):
             if return_attn:
                 x, attn_w = DiTBlock(
@@ -516,15 +519,24 @@ class DiT(nn.Module):
                     gram_rank=self.gram_rank,
                     debug=self.debug
                 )(x, c)
+
+            # Save block output tokens for analysis (after full block processing)
+            if return_block_tokens:
+                block_tokens_all.append(x)  # x shape: (B, N, D)
             # print("DiT: DiTBlock of shape", x.shape)
         x = FinalLayer(self.patch_size, out_channels, self.hidden_size)(x, c) # (B, num_patches, p*p*c)
         # print("DiT: FinalLayer of shape", x.shape)
-        x = jnp.reshape(x, (batch_size, num_patches_side, num_patches_side, 
+        x = jnp.reshape(x, (batch_size, num_patches_side, num_patches_side,
                             self.patch_size, self.patch_size, out_channels))
         x = jnp.einsum('bhwpqc->bhpwqc', x)
         x = rearrange(x, 'B H P W Q C -> B (H P) (W Q) C', H=int(num_patches_side), W=int(num_patches_side))
         assert x.shape == (batch_size, input_size, input_size, out_channels)
-        
-        if return_attn:
+
+        # Return based on what was requested
+        if return_attn and return_block_tokens:
+            return x, attn_weights_all, block_tokens_all
+        elif return_attn:
             return x, attn_weights_all
+        elif return_block_tokens:
+            return x, block_tokens_all
         return x

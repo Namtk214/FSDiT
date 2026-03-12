@@ -25,6 +25,8 @@ from utils.train_state import TrainState, target_update
 from utils.checkpoint import Checkpoint
 from utils.stable_vae import StableVAE
 from diffusion_transformer import DiT
+import matplotlib
+matplotlib.use('Agg')  # Non-interactive backend for server environments
 
 FLAGS = flags.FLAGS
 flags.DEFINE_string('data_dir', '/kaggle/input/datasets/arjunashok33/miniimagenet', 'Dataset directory.')
@@ -84,6 +86,38 @@ wandb_config = default_wandb_config()
 wandb_config.update({'project': 'flow', 'name': 'flow_miniimagenet'})
 config_flags.DEFINE_config_dict('wandb', wandb_config, lock_config=False)
 config_flags.DEFINE_config_dict('model', model_config, lock_config=False)
+
+##############################################
+## Block Similarity Analysis
+##############################################
+
+def compute_block_cosine_matrix(block_tokens):
+    """
+    Compute pairwise cosine similarity matrix between all blocks.
+
+    Args:
+        block_tokens: List of L tensors, each with shape (B, N, D)
+                      where L = num_blocks, B = batch_size,
+                      N = num_tokens, D = hidden_dim
+
+    Returns:
+        sim_mat: (L, L) cosine similarity matrix averaged over batch and tokens
+    """
+    # Stack into single tensor: (L, B, N, D)
+    H = jnp.stack(block_tokens, axis=0)
+
+    # Normalize along hidden dimension
+    H_norm = H / (jnp.linalg.norm(H, axis=-1, keepdims=True) + 1e-8)
+
+    # Compute pairwise cosine: (L, 1, B, N, D) * (1, L, B, N, D)
+    # Then sum over D to get cosine values
+    cosine_vals = jnp.einsum('labnd,lbbnd->labn', H_norm[:, None], H_norm[None, :])
+
+    # Average over batch and tokens: (L, L, B, N) -> (L, L)
+    sim_mat = jnp.mean(cosine_vals, axis=(-2, -1))
+
+    return sim_mat
+
 
 ##############################################
 ## Model Definitions.
@@ -995,6 +1029,96 @@ def main(_):
                     axs[j].set_title(f"class {visualize_labels[j, 0]}")
                 wandb.log({f'sample_cfg_{cfg_scale}': wandb.Image(fig)}, step=i)
                 plt.close(fig)
+
+        # Block similarity analysis (every 50000 steps)
+        if i % 50000 == 0 and jax.process_index() == 0:
+            print(f"\n[Step {i}] Computing block-wise cosine similarity...")
+
+            # Track specific timesteps as per guide
+            track_timesteps = [1, 4, 8, 32, 64, 127] if FLAGS.model.denoise_timesteps >= 128 else [1, 4, 8, 16, 32, 49]
+
+            # Use a small batch for similarity analysis
+            sim_batch_size = min(4, valid_images_small.shape[1])
+            sim_images = valid_images_small[:, :sim_batch_size]
+            sim_labels = visualize_labels[:, :sim_batch_size]
+
+            # Sample from noise
+            sim_key = jax.random.PRNGKey(42 + i)
+            sim_eps = jax.random.normal(sim_key, sim_images.shape)
+
+            similarity_data = {}
+            delta_t = 1.0 / FLAGS.model.denoise_timesteps
+            x_sim = sim_eps
+
+            for ti in range(FLAGS.model.denoise_timesteps):
+                t_vec = jnp.full((x_sim.shape[0], x_sim.shape[1]), (ti + 0.5) / FLAGS.model.denoise_timesteps)
+
+                # Check if we should track this timestep
+                if ti in track_timesteps:
+                    # Get predictions with block tokens
+                    # Note: call_model_pmap doesn't support return_block_tokens yet
+                    # So we need to call the underlying model directly
+                    # Unflatten pmap dimension for model call
+                    x_flat = x_sim.reshape(-1, *x_sim.shape[2:])  # (devices*batch, H, W, C)
+                    t_flat = t_vec.reshape(-1)  # (devices*batch,)
+                    labels_flat = sim_labels.reshape(-1)  # (devices*batch,)
+
+                    # For CFG: duplicate batch
+                    num_classes = FLAGS.model.num_classes
+                    labels_uncond = jnp.ones_like(labels_flat) * num_classes
+                    x_expanded = jnp.tile(x_flat, (2, 1, 1, 1))
+                    t_expanded = jnp.tile(t_flat, (2,))
+                    labels_full = jnp.concatenate([labels_flat, labels_uncond], axis=0)
+
+                    # Get v_pred and block tokens
+                    v_pred, block_tokens = model.model_eps.apply_fn(
+                        {'params': model.model_eps.params},
+                        x_expanded, t_expanded, labels_full,
+                        train=False, force_drop_ids=False, return_block_tokens=True
+                    )
+
+                    # Extract conditional branch only (first half of batch)
+                    batch_total = x_flat.shape[0]
+                    block_tokens_cond = [bt[:batch_total] for bt in block_tokens]
+
+                    # Compute similarity matrix
+                    sim_mat = compute_block_cosine_matrix(block_tokens_cond)
+                    similarity_data[ti] = np.array(sim_mat)
+
+                    # Use conditional predictions for sampling (CFG)
+                    v_pred_cond = v_pred[:batch_total]
+                    v_pred_uncond = v_pred[batch_total:]
+                    v_final = v_pred_uncond + FLAGS.model.cfg_scale * (v_pred_cond - v_pred_uncond)
+
+                    # Reshape back to pmap format
+                    v_final = v_final.reshape(x_sim.shape)
+                else:
+                    # Normal prediction without block tokens
+                    v_final = model.call_model_pmap(x_sim, t_vec, sim_labels, True, FLAGS.model.cfg_scale)
+
+                # Update latent
+                x_sim = x_sim + v_final * delta_t
+
+            # Log similarity matrices to WandB
+            for timestep, sim_mat in similarity_data.items():
+                # Create heatmap using matplotlib
+                fig, ax = plt.subplots(figsize=(10, 8))
+                im = ax.imshow(sim_mat, cmap='viridis', vmin=0, vmax=1)
+                ax.set_xlabel('Block Index')
+                ax.set_ylabel('Block Index')
+                ax.set_title(f'Block Cosine Similarity at Timestep {timestep}')
+                plt.colorbar(im, ax=ax)
+
+                # Add text annotations
+                for i_ax in range(sim_mat.shape[0]):
+                    for j_ax in range(sim_mat.shape[1]):
+                        ax.text(j_ax, i_ax, f'{sim_mat[i_ax, j_ax]:.2f}',
+                               ha="center", va="center", color="w", fontsize=6)
+
+                wandb.log({f'block_similarity/timestep_{timestep:03d}': wandb.Image(fig)}, step=i)
+                plt.close(fig)
+
+            print(f"[Step {i}] Logged similarity matrices for {len(similarity_data)} timesteps")
 
         del valid_images, valid_labels
         print("Finished eval")
