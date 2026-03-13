@@ -70,9 +70,9 @@ model_config = ml_collections.ConfigDict({
     'gram_rank': 64,           # Low-rank dimension for Gram branch
     # Block cosine-squared regularization
     'use_block_reg': True,    # Enable block-wise cosine-squared regularization
-    'lambda_block_04': 1e-4,   # Weight for block 0 vs block 4 regularization
-    'lambda_block_4_10': 1e-3, # Weight for block 4 vs block 10 regularization
-    'lambda_block_10_11': 1e-2, # Weight for block 10 vs block 11 regularization
+    'lambda_block_04': 0.1,   # Weight for block 0 vs block 4 regularization
+    'lambda_block_4_10': 0.1, # Weight for block 4 vs block 10 regularization
+    'lambda_block_10_11': 0.1, # Weight for block 10 vs block 11 regularization
     # Logging
     'loss_ema_beta': 0.99,     # EMA smoothing factor for loss
     # Debug
