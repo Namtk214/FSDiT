@@ -68,10 +68,11 @@ model_config = ml_collections.ConfigDict({
     # Gram branch support (new)
     'use_gram_branch': False,   # Set to True to enable Gram branch
     'gram_rank': 64,           # Low-rank dimension for Gram branch
-    # Block cosine-squared regularization (2-region design: 0-7 | 8-11)
+    # Block cosine-squared regularization (4-region design: 0-2 | 3-5 | 6-8 | 9-11)
     'use_block_reg': True,         # Enable block-wise cosine-squared regularization
-    'lambda_block_5_9': 0.1,       # Init weight for block 5 vs 9 (mid-to-late)
-    'lambda_block_7_10': 0.1,      # Init weight for block 7 vs 10 (boundary-deep)
+    'lambda_block_2_3': 0.1,       # Init weight for block 2 vs 3 (A-B boundary)
+    'lambda_block_5_6': 0.1,       # Init weight for block 5 vs 6 (B-C boundary)
+    'lambda_block_8_9': 0.1,       # Init weight for block 8 vs 9 (C-D boundary)
     'block_reg_stopgrad': 'none',  # Stop-grad mode: "none", "deep_anchor", "shallow_anchor"
     'block_reg_schedule': 'cosine',       # Lambda decay: "constant", "cosine"
     'block_reg_min_ratio': 0.1,           # Min ratio for cosine decay (lambda decays to init*min_ratio)
@@ -543,29 +544,34 @@ class FlowTrainer(flax.struct.PyTreeNode):
                 stopgrad_mode = self.config.get('block_reg_stopgrad', 'deep_anchor')
                 schedule = self.config.get('block_reg_schedule', 'cosine')
                 min_ratio = self.config.get('block_reg_min_ratio', 0.1)
-                lambda_5_9_init = self.config.get('lambda_block_5_9', 1e-4)
-                lambda_7_10_init = self.config.get('lambda_block_7_10', 1e-4)
+                lambda_2_3_init = self.config.get('lambda_block_2_3', 1e-4)
+                lambda_5_6_init = self.config.get('lambda_block_5_6', 1e-4)
+                lambda_8_9_init = self.config.get('lambda_block_8_9', 1e-4)
 
                 # Compute effective lambdas with decay schedule
                 total_steps = self.config.get('total_steps', 1000000)  # Use actual training total steps
                 current_step = self.model.step
-                lambda_5_9 = get_lambda_with_schedule(current_step, lambda_5_9_init, total_steps, schedule, min_ratio)
-                lambda_7_10 = get_lambda_with_schedule(current_step, lambda_7_10_init, total_steps, schedule, min_ratio)
+                lambda_2_3 = get_lambda_with_schedule(current_step, lambda_2_3_init, total_steps, schedule, min_ratio)
+                lambda_5_6 = get_lambda_with_schedule(current_step, lambda_5_6_init, total_steps, schedule, min_ratio)
+                lambda_8_9 = get_lambda_with_schedule(current_step, lambda_8_9_init, total_steps, schedule, min_ratio)
 
-                # 2-region design: Region A (blocks 0-7) | Region B (blocks 8-11)
-                # Cross-region pairs: (5,9) mid-to-late, (7,10) boundary-deep
-                r_5_9 = block_cos2_reg(block_tokens[5], block_tokens[9], stopgrad_mode)
-                r_7_10 = block_cos2_reg(block_tokens[7], block_tokens[10], stopgrad_mode)
+                # 4-region design: Region A (0-2) | Region B (3-5) | Region C (6-8) | Region D (9-11)
+                # Cross-region boundary pairs: (2,3) A-B, (5,6) B-C, (8,9) C-D
+                r_2_3 = block_cos2_reg(block_tokens[2], block_tokens[3], stopgrad_mode)
+                r_5_6 = block_cos2_reg(block_tokens[5], block_tokens[6], stopgrad_mode)
+                r_8_9 = block_cos2_reg(block_tokens[8], block_tokens[9], stopgrad_mode)
 
-                reg_contrib = lambda_5_9 * r_5_9 + lambda_7_10 * r_7_10
+                reg_contrib = lambda_2_3 * r_2_3 + lambda_5_6 * r_5_6 + lambda_8_9 * r_8_9
                 loss = l2_loss + reg_contrib
 
                 return loss, {
                     'l2_loss': l2_loss,
-                    'block_reg_5_9': r_5_9,
-                    'block_reg_7_10': r_7_10,
-                    'lambda_5_9': lambda_5_9,
-                    'lambda_7_10': lambda_7_10,
+                    'block_reg_2_3': r_2_3,
+                    'block_reg_5_6': r_5_6,
+                    'block_reg_8_9': r_8_9,
+                    'lambda_2_3': lambda_2_3,
+                    'lambda_5_6': lambda_5_6,
+                    'lambda_8_9': lambda_8_9,
                     'reg_contrib': reg_contrib,
                     'total_loss': loss,
                     'v_abs_mean': jnp.abs(v_t).mean(),
@@ -853,25 +859,31 @@ def main(_):
 
     # Block regularization info
     if FLAGS.model.use_block_reg:
-        print(f"\n🔵 BLOCK REGULARIZATION ENABLED (2-region design):")
-        print(f"  - Region A: blocks 0-7")
-        print(f"  - Region B: blocks 8-11")
-        print(f"  - Cross-region pairs:")
-        print(f"    • (5, 9):  mid-to-late pair")
-        print(f"    • (7, 10): boundary-deep pair")
+        print(f"\n🔵 BLOCK REGULARIZATION ENABLED (4-region design):")
+        print(f"  - Region A (early):     blocks 0, 1, 2")
+        print(f"  - Region B (early-mid): blocks 3, 4, 5")
+        print(f"  - Region C (mid-late):  blocks 6, 7, 8")
+        print(f"  - Region D (late):      blocks 9, 10, 11")
+        print(f"  - Cross-region boundary pairs:")
+        print(f"    • (2, 3): A-B boundary")
+        print(f"    • (5, 6): B-C boundary")
+        print(f"    • (8, 9): C-D boundary")
         print(f"  - Initial lambda weights:")
-        print(f"    - λ_5_9:  {FLAGS.model.lambda_block_5_9:.2e}")
-        print(f"    - λ_7_10: {FLAGS.model.lambda_block_7_10:.2e}")
+        print(f"    - λ_2_3: {FLAGS.model.lambda_block_2_3:.2e}")
+        print(f"    - λ_5_6: {FLAGS.model.lambda_block_5_6:.2e}")
+        print(f"    - λ_8_9: {FLAGS.model.lambda_block_8_9:.2e}")
         print(f"  - Stop-gradient mode: {FLAGS.model.block_reg_stopgrad}")
         print(f"  - Lambda schedule: {FLAGS.model.block_reg_schedule}")
         if FLAGS.model.block_reg_schedule == 'cosine':
             print(f"    - Min ratio: {FLAGS.model.block_reg_min_ratio}")
             print(f"    - Total steps: {FLAGS.max_steps}")
-            final_lambda_59 = FLAGS.model.lambda_block_5_9 * FLAGS.model.block_reg_min_ratio
-            final_lambda_710 = FLAGS.model.lambda_block_7_10 * FLAGS.model.block_reg_min_ratio
-            print(f"    - Final λ_5_9:  {final_lambda_59:.2e} (at step {FLAGS.max_steps})")
-            print(f"    - Final λ_7_10: {final_lambda_710:.2e} (at step {FLAGS.max_steps})")
-        print(f"  - Loss: L_total = L_gen + λ_5_9(t)*R_5_9 + λ_7_10(t)*R_7_10")
+            final_lambda_23 = FLAGS.model.lambda_block_2_3 * FLAGS.model.block_reg_min_ratio
+            final_lambda_56 = FLAGS.model.lambda_block_5_6 * FLAGS.model.block_reg_min_ratio
+            final_lambda_89 = FLAGS.model.lambda_block_8_9 * FLAGS.model.block_reg_min_ratio
+            print(f"    - Final λ_2_3: {final_lambda_23:.2e} (at step {FLAGS.max_steps})")
+            print(f"    - Final λ_5_6: {final_lambda_56:.2e} (at step {FLAGS.max_steps})")
+            print(f"    - Final λ_8_9: {final_lambda_89:.2e} (at step {FLAGS.max_steps})")
+        print(f"  - Loss: L_total = L_gen + λ_2_3(t)*R_2_3 + λ_5_6(t)*R_5_6 + λ_8_9(t)*R_8_9")
     else:
         print(f"\n❌ Block regularization disabled")
 
@@ -1341,15 +1353,19 @@ def main(_):
             # Add block regularization metrics if enabled
             if FLAGS.model.use_block_reg:
                 # Raw regularization terms
-                if 'block_reg_5_9' in update_info:
-                    train_metrics['block_reg/R_5_9'] = float(update_info['block_reg_5_9'])
-                if 'block_reg_7_10' in update_info:
-                    train_metrics['block_reg/R_7_10'] = float(update_info['block_reg_7_10'])
+                if 'block_reg_2_3' in update_info:
+                    train_metrics['block_reg/R_2_3'] = float(update_info['block_reg_2_3'])
+                if 'block_reg_5_6' in update_info:
+                    train_metrics['block_reg/R_5_6'] = float(update_info['block_reg_5_6'])
+                if 'block_reg_8_9' in update_info:
+                    train_metrics['block_reg/R_8_9'] = float(update_info['block_reg_8_9'])
                 # Effective lambda values (with decay)
-                if 'lambda_5_9' in update_info:
-                    train_metrics['block_reg/lambda_5_9'] = float(update_info['lambda_5_9'])
-                if 'lambda_7_10' in update_info:
-                    train_metrics['block_reg/lambda_7_10'] = float(update_info['lambda_7_10'])
+                if 'lambda_2_3' in update_info:
+                    train_metrics['block_reg/lambda_2_3'] = float(update_info['lambda_2_3'])
+                if 'lambda_5_6' in update_info:
+                    train_metrics['block_reg/lambda_5_6'] = float(update_info['lambda_5_6'])
+                if 'lambda_8_9' in update_info:
+                    train_metrics['block_reg/lambda_8_9'] = float(update_info['lambda_8_9'])
                 # Total regularization contribution
                 if 'reg_contrib' in update_info:
                     train_metrics['block_reg/total_contribution'] = float(update_info['reg_contrib'])
