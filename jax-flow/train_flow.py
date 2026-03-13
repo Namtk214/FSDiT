@@ -72,7 +72,7 @@ model_config = ml_collections.ConfigDict({
     'use_block_reg': True,         # Enable block-wise cosine-squared regularization
     'lambda_block_5_9': 0.1,       # Init weight for block 5 vs 9 (mid-to-late)
     'lambda_block_7_10': 0.1,      # Init weight for block 7 vs 10 (boundary-deep)
-    'block_reg_stopgrad': 'deep_anchor',  # Stop-grad mode: "none", "deep_anchor", "shallow_anchor"
+    'block_reg_stopgrad': 'none',  # Stop-grad mode: "none", "deep_anchor", "shallow_anchor"
     'block_reg_schedule': 'cosine',       # Lambda decay: "constant", "cosine"
     'block_reg_min_ratio': 0.1,           # Min ratio for cosine decay (lambda decays to init*min_ratio)
     # Logging
