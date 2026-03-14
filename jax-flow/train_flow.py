@@ -70,7 +70,7 @@ model_config = ml_collections.ConfigDict({
     'gram_rank': 64,           # Low-rank dimension for Gram branch
     # Block regularization config
     'use_block_regularization': True,   # Enable block-wise regularization
-    'reg_type': 'decorr_4region',            # Type: "layersync", "decorr_2region", "decorr_4region"
+    'reg_type': 'decorr_2region',            # Type: "layersync", "decorr_2region", "decorr_4region"
 
     # Lambda decay (applies to all reg types)
     'reg_lambda_init': 0.1,             # Initial lambda weight
