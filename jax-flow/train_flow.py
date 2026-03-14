@@ -68,14 +68,13 @@ model_config = ml_collections.ConfigDict({
     # Gram branch support (new)
     'use_gram_branch': False,   # Set to True to enable Gram branch
     'gram_rank': 64,           # Low-rank dimension for Gram branch
-    # Block cosine-squared regularization (4-region design: 0-2 | 3-5 | 6-8 | 9-11)
-    'use_block_reg': True,         # Enable block-wise cosine-squared regularization
-    'lambda_block_2_3': 0.1,       # Init weight for block 2 vs 3 (A-B boundary)
-    'lambda_block_5_6': 0.1,       # Init weight for block 5 vs 6 (B-C boundary)
-    'lambda_block_8_9': 0.1,       # Init weight for block 8 vs 9 (C-D boundary)
-    'block_reg_stopgrad': 'none',  # Stop-grad mode: "none", "deep_anchor", "shallow_anchor"
-    'block_reg_schedule': 'cosine',       # Lambda decay: "constant", "cosine"
-    'block_reg_min_ratio': 0.1,           # Min ratio for cosine decay (lambda decays to init*min_ratio)
+    # LayerSync regularization (paper-style: maximize similarity between shallow and deep block)
+    'use_layersync': True,              # Enable LayerSync regularization
+    'layersync_shallow_block': 4,       # Shallow block (receives gradient)
+    'layersync_deep_block': 7,          # Deep block (anchor, stop-grad)
+    'lambda_layersync_init': 0.1,       # Initial lambda weight
+    'layersync_schedule': 'linear',     # Lambda decay: "constant", "linear", "cosine"
+    'layersync_lambda_min': 0.0,        # Minimum lambda at end of training (for linear/cosine decay)
     # Logging
     'loss_ema_beta': 0.99,     # EMA smoothing factor for loss
     # Debug
@@ -127,44 +126,40 @@ def compute_block_cosine_matrix(block_tokens):
     return sim_mat
 
 
-def block_cos2_reg(h_a, h_b, stopgrad_mode="none", eps=1e-8):
+def layersync_loss(h_shallow, h_deep, eps=1e-8):
     """
-    Compute cosine-squared regularization between two block outputs with optional stop-gradient.
+    Compute LayerSync loss (paper-style): negative cosine similarity.
 
-    This regularizer encourages the two blocks to have decorrelated representations
-    by penalizing high cosine similarity (both positive and negative).
+    This encourages the shallow block to align with (become more similar to) the deep block.
+    The deep block acts as a fixed anchor (stop-gradient applied).
+
+    Loss = -mean(cosine_similarity(h_shallow, sg(h_deep)))
+
+    Minimizing this loss maximizes cosine similarity, pulling h_shallow closer to h_deep.
 
     Args:
-        h_a: tensor of shape (B, N, D) - output from shallower block
-        h_b: tensor of shape (B, N, D) - output from deeper block
-        stopgrad_mode: str - "none", "deep_anchor", or "shallow_anchor"
-            - "none": both blocks receive gradients
-            - "deep_anchor": detach h_b (deeper block is anchor, adjust shallower)
-            - "shallow_anchor": detach h_a (shallower block is anchor, adjust deeper)
+        h_shallow: tensor of shape (B, N, D) - output from shallow block (receives gradient)
+        h_deep: tensor of shape (B, N, D) - output from deep block (anchor, stop-grad)
         eps: small constant for numerical stability
 
     Returns:
-        scalar: mean of squared cosine similarity values across all tokens
+        scalar: negative mean cosine similarity
     """
-    # Apply stop-gradient based on mode
-    if stopgrad_mode == "deep_anchor":
-        h_b = jax.lax.stop_gradient(h_b)
-    elif stopgrad_mode == "shallow_anchor":
-        h_a = jax.lax.stop_gradient(h_a)
-    # else: "none" - no stop-gradient
-
     # Normalize along hidden dimension
-    h_a_norm = h_a / (jnp.linalg.norm(h_a, axis=-1, keepdims=True) + eps)
-    h_b_norm = h_b / (jnp.linalg.norm(h_b, axis=-1, keepdims=True) + eps)
+    h_shallow_norm = h_shallow / (jnp.linalg.norm(h_shallow, axis=-1, keepdims=True) + eps)
+    h_deep_norm = h_deep / (jnp.linalg.norm(h_deep, axis=-1, keepdims=True) + eps)
+
+    # Stop-gradient on deep block (anchor/reference)
+    h_deep_norm = jax.lax.stop_gradient(h_deep_norm)
 
     # Compute cosine similarity for each token: (B, N)
-    cos = jnp.sum(h_a_norm * h_b_norm, axis=-1)
+    cos = jnp.sum(h_shallow_norm * h_deep_norm, axis=-1)
 
-    # Return mean of squared cosine
-    return jnp.mean(cos ** 2)
+    # Return NEGATIVE mean cosine (minimize this -> maximize similarity)
+    return -jnp.mean(cos)
 
 
-def get_lambda_with_schedule(step, lambda_init, total_steps, schedule="cosine", min_ratio=0.1):
+def get_lambda_with_schedule(step, lambda_init, total_steps, schedule="linear", lambda_min=0.0):
     """
     Compute effective lambda with decay schedule.
 
@@ -172,19 +167,23 @@ def get_lambda_with_schedule(step, lambda_init, total_steps, schedule="cosine", 
         step: current training step
         lambda_init: initial lambda value
         total_steps: total training steps
-        schedule: "constant" or "cosine"
-        min_ratio: minimum ratio for decay (lambda decays to lambda_init * min_ratio)
+        schedule: "constant", "linear", or "cosine"
+        lambda_min: minimum lambda value at end of training
 
     Returns:
         effective lambda value
     """
     if schedule == "constant":
         return lambda_init
-    elif schedule == "cosine":
-        # Cosine decay: lambda_init * [min_ratio + (1 - min_ratio) * 0.5 * (1 + cos(pi * step / total_steps))]
+    elif schedule == "linear":
+        # Linear decay: lambda_init -> lambda_min
         progress = jnp.minimum(step / total_steps, 1.0)
-        decay_factor = min_ratio + (1.0 - min_ratio) * 0.5 * (1.0 + jnp.cos(jnp.pi * progress))
-        return lambda_init * decay_factor
+        return lambda_init * (1.0 - progress) + lambda_min * progress
+    elif schedule == "cosine":
+        # Cosine decay: smooth decay from lambda_init to lambda_min
+        progress = jnp.minimum(step / total_steps, 1.0)
+        decay_factor = 0.5 * (1.0 + jnp.cos(jnp.pi * progress))
+        return lambda_min + (lambda_init - lambda_min) * decay_factor
     else:
         return lambda_init
 
@@ -525,10 +524,10 @@ class FlowTrainer(flax.struct.PyTreeNode):
             if self.config['t_conditioning'] == 0:
                 t = jnp.zeros_like(t)
 
-            # Check if we need block tokens for regularization
-            use_block_reg = self.config.get('use_block_reg', False)
+            # Check if we need block tokens for LayerSync regularization
+            use_layersync = self.config.get('use_layersync', False)
 
-            if use_block_reg:
+            if use_layersync:
                 # Call model with return_block_tokens=True
                 v_prime, block_tokens = self.model(
                     x_t, t, labels, train=True,
@@ -540,39 +539,29 @@ class FlowTrainer(flax.struct.PyTreeNode):
                 # Compute generation loss
                 l2_loss = jnp.mean((v_prime - v_t) ** 2)
 
-                # Get regularization config
-                stopgrad_mode = self.config.get('block_reg_stopgrad', 'deep_anchor')
-                schedule = self.config.get('block_reg_schedule', 'cosine')
-                min_ratio = self.config.get('block_reg_min_ratio', 0.1)
-                lambda_2_3_init = self.config.get('lambda_block_2_3', 1e-4)
-                lambda_5_6_init = self.config.get('lambda_block_5_6', 1e-4)
-                lambda_8_9_init = self.config.get('lambda_block_8_9', 1e-4)
+                # Get LayerSync config
+                shallow_block = self.config.get('layersync_shallow_block', 4)
+                deep_block = self.config.get('layersync_deep_block', 7)
+                schedule = self.config.get('layersync_schedule', 'linear')
+                lambda_init = self.config.get('lambda_layersync_init', 0.1)
+                lambda_min = self.config.get('layersync_lambda_min', 0.0)
 
-                # Compute effective lambdas with decay schedule
-                total_steps = self.config.get('total_steps', 1000000)  # Use actual training total steps
+                # Compute effective lambda with decay schedule
+                total_steps = self.config.get('total_steps', 1000000)
                 current_step = self.model.step
-                lambda_2_3 = get_lambda_with_schedule(current_step, lambda_2_3_init, total_steps, schedule, min_ratio)
-                lambda_5_6 = get_lambda_with_schedule(current_step, lambda_5_6_init, total_steps, schedule, min_ratio)
-                lambda_8_9 = get_lambda_with_schedule(current_step, lambda_8_9_init, total_steps, schedule, min_ratio)
+                lambda_t = get_lambda_with_schedule(current_step, lambda_init, total_steps, schedule, lambda_min)
 
-                # 4-region design: Region A (0-2) | Region B (3-5) | Region C (6-8) | Region D (9-11)
-                # Cross-region boundary pairs: (2,3) A-B, (5,6) B-C, (8,9) C-D
-                r_2_3 = block_cos2_reg(block_tokens[2], block_tokens[3], stopgrad_mode)
-                r_5_6 = block_cos2_reg(block_tokens[5], block_tokens[6], stopgrad_mode)
-                r_8_9 = block_cos2_reg(block_tokens[8], block_tokens[9], stopgrad_mode)
+                # LayerSync loss: negative cosine similarity (maximize similarity)
+                # Shallow block (4) aligns with deep block (7, stop-grad)
+                L_sync = layersync_loss(block_tokens[shallow_block], block_tokens[deep_block])
 
-                reg_contrib = lambda_2_3 * r_2_3 + lambda_5_6 * r_5_6 + lambda_8_9 * r_8_9
-                loss = l2_loss + reg_contrib
+                # Total loss
+                loss = l2_loss + lambda_t * L_sync
 
                 return loss, {
                     'l2_loss': l2_loss,
-                    'block_reg_2_3': r_2_3,
-                    'block_reg_5_6': r_5_6,
-                    'block_reg_8_9': r_8_9,
-                    'lambda_2_3': lambda_2_3,
-                    'lambda_5_6': lambda_5_6,
-                    'lambda_8_9': lambda_8_9,
-                    'reg_contrib': reg_contrib,
+                    'layersync_loss': L_sync,
+                    'lambda_layersync': lambda_t,
                     'total_loss': loss,
                     'v_abs_mean': jnp.abs(v_t).mean(),
                     'v_pred_abs_mean': jnp.abs(v_prime).mean(),
@@ -857,35 +846,21 @@ def main(_):
     else:
         print(f"\n❌ Standard DiT: Identity residual (X + attention)")
 
-    # Block regularization info
-    if FLAGS.model.use_block_reg:
-        print(f"\n🔵 BLOCK REGULARIZATION ENABLED (4-region design):")
-        print(f"  - Region A (early):     blocks 0, 1, 2")
-        print(f"  - Region B (early-mid): blocks 3, 4, 5")
-        print(f"  - Region C (mid-late):  blocks 6, 7, 8")
-        print(f"  - Region D (late):      blocks 9, 10, 11")
-        print(f"  - Cross-region boundary pairs:")
-        print(f"    • (2, 3): A-B boundary")
-        print(f"    • (5, 6): B-C boundary")
-        print(f"    • (8, 9): C-D boundary")
-        print(f"  - Initial lambda weights:")
-        print(f"    - λ_2_3: {FLAGS.model.lambda_block_2_3:.2e}")
-        print(f"    - λ_5_6: {FLAGS.model.lambda_block_5_6:.2e}")
-        print(f"    - λ_8_9: {FLAGS.model.lambda_block_8_9:.2e}")
-        print(f"  - Stop-gradient mode: {FLAGS.model.block_reg_stopgrad}")
-        print(f"  - Lambda schedule: {FLAGS.model.block_reg_schedule}")
-        if FLAGS.model.block_reg_schedule == 'cosine':
-            print(f"    - Min ratio: {FLAGS.model.block_reg_min_ratio}")
-            print(f"    - Total steps: {FLAGS.max_steps}")
-            final_lambda_23 = FLAGS.model.lambda_block_2_3 * FLAGS.model.block_reg_min_ratio
-            final_lambda_56 = FLAGS.model.lambda_block_5_6 * FLAGS.model.block_reg_min_ratio
-            final_lambda_89 = FLAGS.model.lambda_block_8_9 * FLAGS.model.block_reg_min_ratio
-            print(f"    - Final λ_2_3: {final_lambda_23:.2e} (at step {FLAGS.max_steps})")
-            print(f"    - Final λ_5_6: {final_lambda_56:.2e} (at step {FLAGS.max_steps})")
-            print(f"    - Final λ_8_9: {final_lambda_89:.2e} (at step {FLAGS.max_steps})")
-        print(f"  - Loss: L_total = L_gen + λ_2_3(t)*R_2_3 + λ_5_6(t)*R_5_6 + λ_8_9(t)*R_8_9")
+    # LayerSync regularization info
+    if FLAGS.model.use_layersync:
+        print(f"\n🔵 LAYERSYNC REGULARIZATION ENABLED (paper-style):")
+        print(f"  - Objective: Maximize similarity between shallow and deep block")
+        print(f"  - Shallow block (aligned): {FLAGS.model.layersync_shallow_block}")
+        print(f"  - Deep block (anchor):     {FLAGS.model.layersync_deep_block}")
+        print(f"  - Stop-gradient: Applied to deep block (fixed anchor)")
+        print(f"  - Initial lambda: {FLAGS.model.lambda_layersync_init:.2e}")
+        print(f"  - Lambda schedule: {FLAGS.model.layersync_schedule}")
+        print(f"  - Lambda min (final): {FLAGS.model.layersync_lambda_min:.2e}")
+        print(f"  - Total steps: {FLAGS.max_steps}")
+        print(f"  - Loss: L_total = L_gen + λ(t) * L_sync")
+        print(f"    where L_sync = -mean(cos(H_shallow, sg(H_deep)))")
     else:
-        print(f"\n❌ Block regularization disabled")
+        print(f"\n❌ LayerSync regularization disabled")
 
     print("="*80 + "\n")
 
@@ -1350,26 +1325,15 @@ def main(_):
                 if 'gram_B_grad_norm' in update_info:
                     train_metrics['gram/B_grad_norm'] = float(update_info['gram_B_grad_norm'])
 
-            # Add block regularization metrics if enabled
-            if FLAGS.model.use_block_reg:
-                # Raw regularization terms
-                if 'block_reg_2_3' in update_info:
-                    train_metrics['block_reg/R_2_3'] = float(update_info['block_reg_2_3'])
-                if 'block_reg_5_6' in update_info:
-                    train_metrics['block_reg/R_5_6'] = float(update_info['block_reg_5_6'])
-                if 'block_reg_8_9' in update_info:
-                    train_metrics['block_reg/R_8_9'] = float(update_info['block_reg_8_9'])
-                # Effective lambda values (with decay)
-                if 'lambda_2_3' in update_info:
-                    train_metrics['block_reg/lambda_2_3'] = float(update_info['lambda_2_3'])
-                if 'lambda_5_6' in update_info:
-                    train_metrics['block_reg/lambda_5_6'] = float(update_info['lambda_5_6'])
-                if 'lambda_8_9' in update_info:
-                    train_metrics['block_reg/lambda_8_9'] = float(update_info['lambda_8_9'])
-                # Total regularization contribution
-                if 'reg_contrib' in update_info:
-                    train_metrics['block_reg/total_contribution'] = float(update_info['reg_contrib'])
-                # Total loss (generation + regularization)
+            # Add LayerSync metrics if enabled
+            if FLAGS.model.use_layersync:
+                # LayerSync loss (negative cosine similarity)
+                if 'layersync_loss' in update_info:
+                    train_metrics['layersync/loss'] = float(update_info['layersync_loss'])
+                # Effective lambda (with decay)
+                if 'lambda_layersync' in update_info:
+                    train_metrics['layersync/lambda'] = float(update_info['lambda_layersync'])
+                # Total loss (generation + LayerSync)
                 if 'total_loss' in update_info:
                     train_metrics['train/total_loss'] = float(update_info['total_loss'])
 
@@ -1385,22 +1349,23 @@ def main(_):
             if fid_score is not None and jax.process_index() == 0:
                 wandb.log({'eval/FID': fid_score}, step=i)
 
-        if i % FLAGS.save_interval == 0 and FLAGS.save_dir is not None:
-            if jax.process_index() == 0:
-                import gc
-                model_single = flax.jax_utils.unreplicate(model)
-                save_target = FLAGS.save_dir
-                save_ext = os.path.splitext(os.path.basename(save_target))[1]
-                if save_target.endswith("/") or not save_ext:
-                    os.makedirs(save_target, exist_ok=True)
-                    save_target = os.path.join(save_target, f"checkpoint_step_{i}.pkl")
-                cp = Checkpoint(save_target, parallel=False)
-                cp.set_model(model_single)
-                del model_single  # Free unreplicated copy before serialization
-                gc.collect()      # Force garbage collection
-                cp.save()
-                del cp
-                gc.collect()      # Clean up after checkpoint
+        # Checkpoint saving disabled
+        # if i % FLAGS.save_interval == 0 and FLAGS.save_dir is not None:
+        #     if jax.process_index() == 0:
+        #         import gc
+        #         model_single = flax.jax_utils.unreplicate(model)
+        #         save_target = FLAGS.save_dir
+        #         save_ext = os.path.splitext(os.path.basename(save_target))[1]
+        #         if save_target.endswith("/") or not save_ext:
+        #             os.makedirs(save_target, exist_ok=True)
+        #             save_target = os.path.join(save_target, f"checkpoint_step_{i}.pkl")
+        #         cp = Checkpoint(save_target, parallel=False)
+        #         cp.set_model(model_single)
+        #         del model_single  # Free unreplicated copy before serialization
+        #         gc.collect()      # Force garbage collection
+        #         cp.save()
+        #         del cp
+        #         gc.collect()      # Clean up after checkpoint
 
 if __name__ == '__main__':
     app.run(main)
