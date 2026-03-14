@@ -74,7 +74,8 @@ model_config = ml_collections.ConfigDict({
     'layersync_deep_block': 7,          # Deep block (anchor, stop-grad)
     'lambda_layersync_init': 0.1,       # Initial lambda weight
     'layersync_schedule': 'linear',     # Lambda decay: "constant", "linear", "cosine"
-    'layersync_lambda_min': 0.0,        # Minimum lambda at end of training (for linear/cosine decay)
+    'layersync_lambda_min': 0.0,        # Minimum lambda at end of decay
+    'layersync_decay_steps': 60000,     # Lambda decays to 0 at this step (then stays 0)
     # Logging
     'loss_ema_beta': 0.99,     # EMA smoothing factor for loss
     # Debug
@@ -159,33 +160,38 @@ def layersync_loss(h_shallow, h_deep, eps=1e-8):
     return -jnp.mean(cos)
 
 
-def get_lambda_with_schedule(step, lambda_init, total_steps, schedule="linear", lambda_min=0.0):
+def get_lambda_with_schedule(step, lambda_init, decay_steps, schedule="linear", lambda_min=0.0):
     """
     Compute effective lambda with decay schedule.
 
     Args:
         step: current training step
         lambda_init: initial lambda value
-        total_steps: total training steps
+        decay_steps: number of steps to decay from lambda_init to lambda_min
         schedule: "constant", "linear", or "cosine"
-        lambda_min: minimum lambda value at end of training
+        lambda_min: minimum lambda value (reached at decay_steps, then stays constant)
 
     Returns:
         effective lambda value
     """
     if schedule == "constant":
         return lambda_init
-    elif schedule == "linear":
-        # Linear decay: lambda_init -> lambda_min
-        progress = jnp.minimum(step / total_steps, 1.0)
-        return lambda_init * (1.0 - progress) + lambda_min * progress
+
+    # If step >= decay_steps, return lambda_min (stays at minimum)
+    # Use jnp.where for JAX compatibility (no if/else branching on array values)
+    progress = jnp.minimum(step / decay_steps, 1.0)
+
+    if schedule == "linear":
+        # Linear decay: lambda_init -> lambda_min over decay_steps
+        lambda_val = lambda_init * (1.0 - progress) + lambda_min * progress
     elif schedule == "cosine":
-        # Cosine decay: smooth decay from lambda_init to lambda_min
-        progress = jnp.minimum(step / total_steps, 1.0)
+        # Cosine decay: smooth decay from lambda_init to lambda_min over decay_steps
         decay_factor = 0.5 * (1.0 + jnp.cos(jnp.pi * progress))
-        return lambda_min + (lambda_init - lambda_min) * decay_factor
+        lambda_val = lambda_min + (lambda_init - lambda_min) * decay_factor
     else:
-        return lambda_init
+        lambda_val = lambda_init
+
+    return lambda_val
 
 
 ##############################################
@@ -545,11 +551,12 @@ class FlowTrainer(flax.struct.PyTreeNode):
                 schedule = self.config.get('layersync_schedule', 'linear')
                 lambda_init = self.config.get('lambda_layersync_init', 0.1)
                 lambda_min = self.config.get('layersync_lambda_min', 0.0)
+                decay_steps = self.config.get('layersync_decay_steps', 60000)
 
                 # Compute effective lambda with decay schedule
-                total_steps = self.config.get('total_steps', 1000000)
+                # Lambda decays from lambda_init to lambda_min over decay_steps, then stays at lambda_min
                 current_step = self.model.step
-                lambda_t = get_lambda_with_schedule(current_step, lambda_init, total_steps, schedule, lambda_min)
+                lambda_t = get_lambda_with_schedule(current_step, lambda_init, decay_steps, schedule, lambda_min)
 
                 # LayerSync loss: negative cosine similarity (maximize similarity)
                 # Shallow block (4) aligns with deep block (7, stop-grad)
@@ -856,7 +863,8 @@ def main(_):
         print(f"  - Initial lambda: {FLAGS.model.lambda_layersync_init:.2e}")
         print(f"  - Lambda schedule: {FLAGS.model.layersync_schedule}")
         print(f"  - Lambda min (final): {FLAGS.model.layersync_lambda_min:.2e}")
-        print(f"  - Total steps: {FLAGS.max_steps}")
+        print(f"  - Decay steps: {FLAGS.model.layersync_decay_steps} (lambda = 0 at step {FLAGS.model.layersync_decay_steps})")
+        print(f"  - Total training steps: {FLAGS.max_steps}")
         print(f"  - Loss: L_total = L_gen + λ(t) * L_sync")
         print(f"    where L_sync = -mean(cos(H_shallow, sg(H_deep)))")
     else:
