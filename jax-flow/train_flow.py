@@ -70,7 +70,7 @@ model_config = ml_collections.ConfigDict({
     'gram_rank': 64,           # Low-rank dimension for Gram branch
     # Block regularization config
     'use_block_regularization': True,   # Enable block-wise regularization
-    'reg_type': 'decorr_4region',            # Type: "layersync", "decorr_2region", "decorr_4region"
+    'reg_type': 'decorr_3region',            # Type: "layersync", "decorr_2region", "decorr_4region"
 
     # Lambda decay (applies to all reg types)
     'reg_lambda_init': 0.1,             # Initial lambda weight
@@ -82,9 +82,10 @@ model_config = ml_collections.ConfigDict({
     'layersync_shallow_block': 4,       # Shallow block (receives gradient)
     'layersync_deep_block': 7,          # Deep block (anchor, stop-grad)
 
-    # Decorrelation specific (reg_type="decorr_2region" or "decorr_4region")
-    'decorr_stopgrad_mode': 'ndeep_anchore',     # "none", "deep_anchor", "shallow_anchor"
+    # Decorrelation specific (reg_type="decorr_2region", "decorr_3region", or "decorr_4region")
+    'decorr_stopgrad_mode': 'deep_anchor',     # "none", "deep_anchor", "shallow_anchor"
     # 2-region uses pairs: (5,9), (7,10)
+    # 3-region uses pairs: (0,4), (4,10), (10,11)
     # 4-region uses pairs: (2,3), (5,6), (8,9)
     # Logging
     'loss_ema_beta': 0.99,     # EMA smoothing factor for loss
@@ -635,6 +636,23 @@ class FlowTrainer(flax.struct.PyTreeNode):
                         'total_loss': l2_loss + lambda_t * reg_loss,
                     }
 
+                elif reg_type == 'decorr_3region':
+                    # 3-region decorrelation: cos² on pairs (0,4), (4,10), (10,11)
+                    stopgrad_mode = self.config.get('decorr_stopgrad_mode', 'none')
+                    r_0_4 = block_cos2_reg(block_tokens[0], block_tokens[4], stopgrad_mode)
+                    r_4_10 = block_cos2_reg(block_tokens[4], block_tokens[10], stopgrad_mode)
+                    r_10_11 = block_cos2_reg(block_tokens[10], block_tokens[11], stopgrad_mode)
+                    reg_loss = r_0_4 + r_4_10 + r_10_11  # Sum of all three terms
+                    info_dict = {
+                        'l2_loss': l2_loss,
+                        'reg_0_4': r_0_4,
+                        'reg_4_10': r_4_10,
+                        'reg_10_11': r_10_11,
+                        'reg_loss': reg_loss,
+                        'lambda': lambda_t,
+                        'total_loss': l2_loss + lambda_t * reg_loss,
+                    }
+
                 elif reg_type == 'decorr_4region':
                     # 4-region decorrelation: cos² on pairs (2,3), (5,6), (8,9)
                     stopgrad_mode = self.config.get('decorr_stopgrad_mode', 'none')
@@ -973,6 +991,16 @@ def main(_):
             print(f"    - Pairs: (5, 9), (7, 10)")
             print(f"    - Stop-gradient mode: {FLAGS.model.decorr_stopgrad_mode}")
             print(f"    - Loss: L_total = L_gen + λ(t) * [cos²(H_5, H_9) + cos²(H_7, H_10)]")
+
+        elif reg_type == 'decorr_3region':
+            print(f"\n  📕 3-Region Decorrelation:")
+            print(f"    - Objective: Push selected blocks apart (decorrelate)")
+            print(f"    - Region A: blocks 0..4")
+            print(f"    - Region B: blocks 4..10 (overlaps with A and C)")
+            print(f"    - Region C: blocks 10..11")
+            print(f"    - Pairs: (0, 4), (4, 10), (10, 11)")
+            print(f"    - Stop-gradient mode: {FLAGS.model.decorr_stopgrad_mode}")
+            print(f"    - Loss: L_total = L_gen + λ(t) * [cos²(H_0, H_4) + cos²(H_4, H_10) + cos²(H_10, H_11)]")
 
         elif reg_type == 'decorr_4region':
             print(f"\n  📙 4-Region Decorrelation:")
@@ -1474,6 +1502,15 @@ def main(_):
                         train_metrics['reg/R_5_9'] = float(update_info['reg_5_9'])
                     if 'reg_7_10' in update_info:
                         train_metrics['reg/R_7_10'] = float(update_info['reg_7_10'])
+
+                elif reg_type == 'decorr_3region':
+                    # 3-region decorrelation metrics
+                    if 'reg_0_4' in update_info:
+                        train_metrics['reg/R_0_4'] = float(update_info['reg_0_4'])
+                    if 'reg_4_10' in update_info:
+                        train_metrics['reg/R_4_10'] = float(update_info['reg_4_10'])
+                    if 'reg_10_11' in update_info:
+                        train_metrics['reg/R_10_11'] = float(update_info['reg_10_11'])
 
                 elif reg_type == 'decorr_4region':
                     # 4-region decorrelation metrics
