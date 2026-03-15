@@ -70,7 +70,7 @@ model_config = ml_collections.ConfigDict({
     'gram_rank': 64,           # Low-rank dimension for Gram branch
     # Block regularization config
     'use_block_regularization': True,   # Enable block-wise regularization
-    'reg_type': 'decorr_2region',            # Type: "layersync", "decorr_2region", "decorr_4region"
+    'reg_type': 'decorr_4region',            # Type: "layersync", "decorr_2region", "decorr_4region"
 
     # Lambda decay (applies to all reg types)
     'reg_lambda_init': 0.1,             # Initial lambda weight
@@ -83,7 +83,7 @@ model_config = ml_collections.ConfigDict({
     'layersync_deep_block': 7,          # Deep block (anchor, stop-grad)
 
     # Decorrelation specific (reg_type="decorr_2region" or "decorr_4region")
-    'decorr_stopgrad_mode': 'none',     # "none", "deep_anchor", "shallow_anchor"
+    'decorr_stopgrad_mode': 'ndeep_anchore',     # "none", "deep_anchor", "shallow_anchor"
     # 2-region uses pairs: (5,9), (7,10)
     # 4-region uses pairs: (2,3), (5,6), (8,9)
     # Logging
